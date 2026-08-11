@@ -275,6 +275,8 @@ def convert_trained_ckpt(
     output_dir: str,
     reference_model: str,
     norm_stats: str | None = None,
+    *,
+    fill_missing_from_reference: bool = False,
 ) -> None:
     """Convert OpenPI_RLinf trained weights with an OpenPI PyTorch reference."""
     import safetensors.torch
@@ -310,6 +312,21 @@ def convert_trained_ckpt(
             openpi_pytorch_state_dict[key] = tensor.to(torch.bfloat16)
 
     reference_keys = set(reference_state_dict)
+    converted_keys = set(openpi_pytorch_state_dict)
+    missing = reference_keys - converted_keys
+    if fill_missing_from_reference and missing:
+        # Frozen (untrained) parameters are absent from the RLinf checkpoint.
+        # Since the reference is the exact model the run started from, copying
+        # the missing weights straight from it is semantically correct. The
+        # trained (action-expert) weights are already in the converted dict, so
+        # this never overwrites a trained parameter.
+        for key in sorted(missing):
+            if key not in reference_state_dict:
+                continue
+            tensor = reference_state_dict[key]
+            if tensor.dtype != torch.bfloat16:
+                tensor = tensor.to(torch.bfloat16)
+            openpi_pytorch_state_dict[key] = tensor
     converted_keys = set(openpi_pytorch_state_dict)
     missing = reference_keys - converted_keys
     extra = converted_keys - reference_keys

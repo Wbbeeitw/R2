@@ -223,6 +223,9 @@ def convert_sft_to_deploy(
             output_dir=deploy_out,
             reference_model=reference_model,
             norm_stats=None,
+            # VLM is frozen in L_corr runs, so the RLinf state dict has no
+            # gemma weights; fill them from the (identical) reference.
+            fill_missing_from_reference=True,
         )
     # copy norm_stats so create_trained_policy resolves asset "physical-intelligence/libero"
     src = os.path.join(
