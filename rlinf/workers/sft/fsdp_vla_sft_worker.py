@@ -43,7 +43,7 @@ class FSDPVlaSftWorker(FSDPSftWorker):
                 build_official_openpi_sft_dataloader,
             )
 
-            data_loader = build_official_openpi_sft_dataloader(
+            data_loader, data_config = build_official_openpi_sft_dataloader(
                 self.cfg, self._world_size, self._rank, data_paths, eval_dataset
             )
             # DARC-VLA L_corr: mix 1:1 corrected batches (opt-in via
@@ -60,7 +60,11 @@ class FSDPVlaSftWorker(FSDPSftWorker):
                 data_loader = build_mixed_sft_dataloader(
                     data_loader, self.cfg, data_paths
                 )
-            return data_loader
+            # NOTE: must return the (loader, data_config) 2-tuple that
+            # FSDPSftWorker.__init__ unpacks. Returning the duck-typed loader
+            # alone made the unpack drain the whole infinite iterator
+            # (PySequence_Fast) and crash with "too many values to unpack".
+            return data_loader, data_config
         elif model_type == SupportedModel.LINGBOTVLA:
             from rlinf.models.embodiment.lingbotvla.sft_builder import (
                 build_lingbot_sft_dataloader,
