@@ -330,7 +330,17 @@ def build_fixed_correction_batch(
     """Collate the first ``n`` anchors (fixed order, no shuffle) into a list of
     single-sample ``(Observation, actions)`` batches for the fixed-noise eval
     monitor. Same set every call -> apples-to-apples L_corr curve when the
-    worker also reseeds the torch global RNG before each forward."""
+    worker also reseeds the torch global RNG before each forward.
+
+    NOTE: mirrors ``CorrectedLoader.__iter__`` exactly -- the collated batch is
+    converted to torch via ``jax.tree.map(torch.as_tensor, ...)`` BEFORE
+    ``Observation.from_dict``. That is load-bearing: ``from_dict`` keeps numpy
+    uint8 images in NHWC but permutes torch uint8 images to NCHW, and the model
+    expects NCHW. Skipping the torch conversion silently yields NHWC batches
+    that crash the SigLIP conv.
+    """
+    import jax
+
     from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
 
     model_cfg = cfg.actor.model
@@ -347,11 +357,12 @@ def build_fixed_correction_batch(
     )
     tds = _odl.transform_dataset(ds, built_data)
     n = min(n, len(tds))
-    return [
-        (_model.Observation.from_dict(b), b["actions"])
-        for i in range(n)
-        for b in [_odl._collate_fn([tds[i]])]
-    ]
+    out = []
+    for i in range(n):
+        batch = _odl._collate_fn([tds[i]])
+        batch = jax.tree.map(torch.as_tensor, batch)
+        out.append((_model.Observation.from_dict(batch), batch["actions"]))
+    return out
 
 
 def build_mixed_sft_dataloader(policy_loader, cfg, data_paths):
