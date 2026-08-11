@@ -22,3 +22,47 @@ rlinf/envs/maniskill/assets
 PKG-INFO
 *.egg-info/
 .claude/settings.json
+
+# ---------- DARC-VLA / R2 additions ----------
+
+# model weights & checkpoints
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.h5
+*.hdf5
+/checkpoints/
+/ckpt/
+/models/
+
+# RL training outputs & logs
+/wandb/
+.wandb/
+/runs/
+/experiments/
+/eval_results/
+/results/
+
+# data (top-level only; real datasets live outside the repo)
+/data/
+*.parquet
+*.mp4
+
+# python / tooling
+*.py[cod]
+.eggs/
+.env
+.uv/
+.python/
+
+# ide / os
+.idea/
+Thumbs.db
+
+# darc_vla generated artifacts (annotations / checkpoints)
+/darc_vla/artifacts/
+/darc_vla/data/
+/darc_vla/*.pkl
+/darc_vla/*.npz
