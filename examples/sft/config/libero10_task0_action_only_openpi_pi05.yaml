@@ -1,0 +1,28 @@
+# Stage 0 Action-only: frozen VLM, Action Expert only (L_policy on rollout data).
+#
+# == RUNNABLE TODAY ==
+#   openpi.train_expert_only=True -> get_model() calls model.freeze_vlm():
+#     freezes paligemma (SigLIP vision encoder + Gemma); gemma_expert + action head
+#     (action_in_proj/out_proj/time_mlp) stay trainable. use_dsrl=False keeps the
+#     DSRL extra-freezing path off (openpi_action_model.py:1404-1416).
+#
+# == NEXT IMPLEMENTATION STEP (see darc_vla/stage0_plan.md) ==
+#   The correction branch L_corr = FM(o_c⁻, A_c⁺) needs a corrected-batch dataloader
+#   (anchor pairs o_c⁻ + success actions A_c⁺). Because L_corr is the same FM loss
+#   evaluated on different (obs, actions), no model change is needed -- only batch
+#   assembly. When it lands, this config trains L_policy + L_corr on the Action Expert.
+#
+# Run identical to the base config (direct python, absolute --config-path), e.g. for
+# Stage 0:  runner.max_steps=3000 runner.save_interval=1000 ...
+defaults:
+  - libero10_task0_sft_openpi_pi05
+
+runner:
+  logger:
+    experiment_name: "action_only_pi05_libero10_task0_train"
+
+actor:
+  model:
+    openpi:
+      train_expert_only: True # freeze VLM -> train Action Expert only
+      use_dsrl: False # explicit: no DSRL extra freezing

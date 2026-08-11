@@ -1,0 +1,29 @@
+# Stage 0 Full: both DARC-VLA branches (L_policy + L_corr + L_state).
+#
+# == DO NOT RUN YET ==
+#   Requires BOTH implementation tracks (see darc_vla/stage0_plan.md):
+#     - L_corr: corrected-batch dataloader (anchor pairs o_c⁻ + A_c⁺), no model change
+#     - L_state: ranking head + VLM ranking objective + three-stream loss routing
+#   Until those land, the flags below are a SPEC ONLY -- running this now would
+#   silently train plain Base (train_expert_only=False). Do not run.
+#
+# Intended composition: L_policy + L_corr + L_state, all params trainable
+# (VLM trains on the ranking objective; Action Expert on L_policy + L_corr).
+defaults:
+  - libero10_task0_sft_openpi_pi05
+
+runner:
+  logger:
+    experiment_name: "full_pi05_libero10_task0_train"
+
+actor:
+  model:
+    openpi:
+      train_expert_only: False
+      # ---- L_corr (cross-trajectory correction) - intended spec, NOT wired yet ----
+      # correction_data_path: "/workspace/datasets/recap_libero10_task0/libero10_task0_train" # anchor-annotated
+      # correction_loss_weight: 1.0
+      # ---- L_state (outcome ranking) - intended spec, NOT wired yet ----
+      # value_vlm_mode: "mean"
+      # ranking_loss_weight: 1.0
+      # vlm_lora: {rank: 16, alpha: 16}

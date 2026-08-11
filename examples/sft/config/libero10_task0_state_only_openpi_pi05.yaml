@@ -1,0 +1,28 @@
+# Stage 0 State-only: Outcome Ranking branch (L_state = VLM-LoRA ranking).
+#
+# == DO NOT RUN YET ==
+#   Requires the DARC-VLA L_state worker changes (see darc_vla/stage0_plan.md):
+#     1. ranking head (linear + softplus) on pooled VLM features
+#     2. VLM trained on the ranking objective (LoRA is the parameter-efficient
+#        refinement; full-VLM tuning is the simplest first version)
+#     3. worker routes L_policy + L_state (no L_corr)
+#   Until those land, the flags below are a SPEC ONLY -- hydra loads this file but
+#   the fields are not wired, so running it now would silently train plain Base
+#   (train_expert_only=False). Do not run.
+#
+# Intended composition: L_policy + L_state, all params trainable.
+defaults:
+  - libero10_task0_sft_openpi_pi05
+
+runner:
+  logger:
+    experiment_name: "state_only_pi05_libero10_task0_train"
+
+actor:
+  model:
+    openpi:
+      train_expert_only: False
+      # ---- L_state (outcome ranking) - intended spec, NOT wired yet ----
+      # value_vlm_mode: "mean"        # pooling over VLM prefix hidden states
+      # ranking_loss_weight: 1.0
+      # vlm_lora: {rank: 16, alpha: 16}
