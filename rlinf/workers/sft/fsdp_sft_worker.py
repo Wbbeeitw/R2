@@ -204,6 +204,20 @@ class FSDPSftWorker(FSDPModelManager, Worker):
                     f"{'FROZEN' if delta == 0.0 else '*** CHANGED (FREEZE FAILED) ***'}"
                 )
 
+            # DARC fixed-noise correction-eval monitor (opt-in via
+            # actor.model.openpi.correction.fixed_eval). Duck-typed so non-VLA
+            # workers (no run_fixed_correction_eval) no-op.
+            model_cfg = self.cfg.actor.model
+            openpi_cfg = model_cfg.get("openpi", None)
+            corr_cfg = openpi_cfg.get("correction", None) if openpi_cfg else None
+            fev = corr_cfg.get("fixed_eval", None) if corr_cfg else None
+            if (
+                fev is not None
+                and hasattr(self, "run_fixed_correction_eval")
+                and self.global_step % int(fev.get("interval", 100)) == 0
+            ):
+                self.run_fixed_correction_eval(fev)
+
             self.lr_scheduler.step()
             lr_value = self.optimizer.param_groups[0]["lr"]
             grad_norm_value = (

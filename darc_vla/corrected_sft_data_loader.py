@@ -190,12 +190,28 @@ class CorrectedSftDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 
-class CorrectedLoader:
-    """Infinite corrected-batch iterator, yielding (Observation, actions)."""
+class _TorchLoaderHolder:
+    """Duck-typing shim so RLinf's batch-count probe
+    (``get_official_openpi_sft_num_batches`` -> ``loader._data_loader._data_loader``)
+    can reach the inner torch DataLoader of a pure-correction loader."""
 
-    def __init__(self, torch_loader, seed: int = 0):
+    def __init__(self, torch_loader):
+        self._data_loader = torch_loader
+
+
+class CorrectedLoader:
+    """Infinite corrected-batch iterator, yielding (Observation, actions).
+
+    Duck-types the openpi ``DataLoaderImpl``: ``_data_loader`` and
+    ``data_config()`` let the RLinf worker's batch-count / attribute probes
+    work in pure-correction mode (L = L_corr only, no policy mixing).
+    """
+
+    def __init__(self, torch_loader, seed: int = 0, data_config=None):
         self._torch_loader = torch_loader
         self._seed = seed
+        self._data_config = data_config
+        self._data_loader = _TorchLoaderHolder(torch_loader)
 
     def __iter__(self):
         while True:
@@ -205,6 +221,9 @@ class CorrectedLoader:
 
                 batch = jax.tree.map(torch.as_tensor, batch)
                 yield _model.Observation.from_dict(batch), batch["actions"]
+
+    def data_config(self):
+        return self._data_config
 
 
 class MixedSftDataLoader:
@@ -272,7 +291,67 @@ def build_corrected_sft_loader(
         drop_last=True,
         generator=torch.Generator().manual_seed(seed),
     )
-    return CorrectedLoader(torch_loader, seed=seed)
+    return CorrectedLoader(torch_loader, seed=seed, data_config=train_cfg.data)
+
+
+def build_correction_only_sft_loader(cfg, data_paths):
+    """Pure-correction loader: L = L_corr only, no policy batches.
+
+    Opted in via ``cfg.actor.model.openpi.correction.mode == "only"``. The VLM
+    stays frozen (the Action-only config), so this isolates "frozen-VLM
+    capacity" from "supervision conflict" (DARC E0).
+    """
+    corr = getattr(cfg.actor.model.openpi, "correction", None)
+    if corr is None:
+        raise ValueError("correction-only mode requires actor.model.openpi.correction")
+    anchors_path = os.path.expanduser(str(corr["anchors_path"]))
+    data_dir = str(corr.get("data_dir") or data_paths)
+    if not os.path.isfile(anchors_path):
+        raise FileNotFoundError(f"correction.anchors_path not found: {anchors_path}")
+    loader = build_corrected_sft_loader(
+        cfg,
+        data_dir,
+        anchors_path,
+        action_horizon=int(getattr(cfg.actor.model, "num_action_chunks", 10)),
+        seed=int(cfg.actor.get("seed", 0)),
+    )
+    import logging
+
+    logging.info(
+        f"[DARC] correction-only (L = L_corr): {anchors_path} "
+        f"({len(pd.read_parquet(anchors_path))} anchors, no policy batches)"
+    )
+    return loader
+
+
+def build_fixed_correction_batch(
+    cfg, data_dir, anchors_path, n: int = 32, *, action_horizon: int = 10
+):
+    """Collate the first ``n`` anchors (fixed order, no shuffle) into a list of
+    single-sample ``(Observation, actions)`` batches for the fixed-noise eval
+    monitor. Same set every call -> apples-to-apples L_corr curve when the
+    worker also reseeds the torch global RNG before each forward."""
+    from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
+
+    model_cfg = cfg.actor.model
+    train_cfg = get_openpi_config(
+        model_cfg.openpi.config_name,
+        model_path=model_cfg.model_path,
+        batch_size=1,
+        repo_id=data_dir,
+        data_kwargs=getattr(model_cfg, "openpi_data", None),
+    )
+    built_data = train_cfg.data.create(train_cfg.assets_dirs, train_cfg.model)
+    ds = CorrectedSftDataset(
+        anchors_path, data_dir, action_horizon=action_horizon
+    )
+    tds = _odl.transform_dataset(ds, built_data)
+    n = min(n, len(tds))
+    return [
+        (_model.Observation.from_dict(b), b["actions"])
+        for i in range(n)
+        for b in [_odl._collate_fn([tds[i]])]
+    ]
 
 
 def build_mixed_sft_dataloader(policy_loader, cfg, data_paths):

@@ -43,16 +43,25 @@ class FSDPVlaSftWorker(FSDPSftWorker):
                 build_official_openpi_sft_dataloader,
             )
 
+            corr = getattr(self.cfg.actor.model.openpi, "correction", None)
+            mode = str(corr.get("mode", "mix")) if corr is not None else "mix"
+            if not eval_dataset and corr is not None and mode == "only":
+                # DARC E0: pure-correction training (L = L_corr, no policy
+                # batches) with a frozen VLM. Isolates "frozen-VLM capacity"
+                # from "supervision conflict".
+                from darc_vla.corrected_sft_data_loader import (
+                    build_correction_only_sft_loader,
+                )
+
+                loader = build_correction_only_sft_loader(self.cfg, data_paths)
+                return loader, loader.data_config()
+
             data_loader, data_config = build_official_openpi_sft_dataloader(
                 self.cfg, self._world_size, self._rank, data_paths, eval_dataset
             )
             # DARC-VLA L_corr: mix 1:1 corrected batches (opt-in via
             # actor.model.openpi.correction). Training only.
-            if (
-                not eval_dataset
-                and getattr(self.cfg.actor.model.openpi, "correction", None)
-                is not None
-            ):
+            if not eval_dataset and corr is not None and mode == "mix":
                 from darc_vla.corrected_sft_data_loader import (
                     build_mixed_sft_dataloader,
                 )
@@ -97,6 +106,49 @@ class FSDPVlaSftWorker(FSDPSftWorker):
     def get_eval_model_output(self, batch: dict[str, Any]):
         # now the eval is not supported for embodied sft
         raise NotImplementedError("eval is not supported for embodied sft right now.")
+
+    def run_fixed_correction_eval(self, fev_cfg: DictConfig):
+        """DARC E0 fixed-noise correction-loss monitor.
+
+        openpi samples flow-matching noise via ``torch.normal`` and timesteps
+        via ``torch.distributions.Beta.sample`` -- both draw from the torch
+        global RNG. Reseeding it to a fixed seed before every forward makes
+        each step's L_corr an apples-to-apples number over the same 32 anchors,
+        so the trend isolates "is the model learning the correction" from
+        "which noise/timestep did this step sample".
+        """
+        if not hasattr(self, "_fixed_corr_batch"):
+            corr = self.cfg.actor.model.openpi.correction
+            data_dir = str(corr.get("data_dir") or self.cfg.data.train_data_paths)
+            anchors = str(corr["anchors_path"])
+            n = int(fev_cfg.get("n_anchors", 32))
+            from darc_vla.corrected_sft_data_loader import (
+                build_fixed_correction_batch,
+            )
+
+            self._fixed_corr_batch = build_fixed_correction_batch(
+                self.cfg,
+                data_dir,
+                anchors,
+                n=n,
+                action_horizon=int(
+                    getattr(self.cfg.actor.model, "num_action_chunks", 10)
+                ),
+            )
+            self._logger.info(
+                f"[DARC_FIXED] built fixed eval batch: "
+                f"{len(self._fixed_corr_batch)} anchors"
+            )
+        seed = int(fev_cfg.get("seed", 20260812))
+        total = 0.0
+        for i, (obs, acts) in enumerate(self._fixed_corr_batch):
+            torch.manual_seed(seed + i)
+            with torch.no_grad():
+                total += float(self.get_train_model_output((obs, acts))[0])
+        mean = total / len(self._fixed_corr_batch)
+        self._logger.info(
+            f"[DARC_FIXED] step {self.global_step} fixed_corr_loss={mean:.6f}"
+        )
 
     def get_train_model_output(self, batch: Any) -> tuple[torch.Tensor, dict[str, Any]]:
         with self.amp_context:

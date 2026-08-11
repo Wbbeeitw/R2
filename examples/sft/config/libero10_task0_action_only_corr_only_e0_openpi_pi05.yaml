@@ -1,0 +1,50 @@
+# DARC E0: pure-correction training (L = L_corr ONLY) with a frozen VLM.
+#
+# Isolates two competing hypotheses for why the 2000-step mixed run (L_policy +
+# L_corr 1:1, frozen VLM) did not move CPR:
+#   (a) "frozen-VLM capacity"      -- the frozen representation cannot absorb
+#                                     o_c^- -> A_c^+ corrections at all, or
+#   (b) "supervision conflict"     -- L_policy keeps teaching o_c^- -> A_c^- on the
+#                                     same anchor observations, so the flow policy
+#                                     preserves a bimodal A^- / A^+ target instead
+#                                     of overwriting A^- with A^+.
+#
+# E0 removes L_policy entirely (correction.mode: "only") over 32 anchors, keeps the
+# VLM frozen (inherits action_only: train_expert_only=True + use_orig_params=True +
+# verify_frozen_params=True), and monitors a FIXED-noise correction loss
+# (correction.fixed_eval) every 100 steps -- same 32 anchors, same flow-matching
+# noise/timestep seeds -- so the L_corr trend is apples-to-apples.
+#
+#   Success signal:  fixed_corr_loss drops well below its init AND CPR_train on the
+#                    32 anchors reaches ~0.8-0.9+  =>  (b), capacity is enough.
+#   Failure signal:  fixed_corr_loss stays flat    =>  (a), frozen VLM cannot fit it.
+#
+# Run identical to the base config:
+#   cd /workspace/RLinf && \
+#   EMBODIED_PATH=/workspace/RLinf/examples/sft LIBERO_REPO_PATH=/opt/venv/openpi/libero \
+#   PYTHONPATH=/workspace/RLinf:/opt/venv/openpi/libero \
+#   /opt/venv/openpi/bin/python examples/sft/train_vla_sft.py \
+#     --config-path /workspace/RLinf/examples/sft/config/ \
+#     --config-name libero10_task0_action_only_corr_only_e0_openpi_pi05 \
+#     runner.logger.log_path=/workspace/workspcae/<run-name> \
+#     runner.max_steps=1000 runner.save_interval=1000 \
+#     actor.optim.total_training_steps=1000 actor.optim.lr_warmup_steps=100
+defaults:
+  - libero10_task0_action_only_openpi_pi05
+  - _self_ # keep _self_ LAST so this file's overrides win over the inherited base
+
+runner:
+  logger:
+    experiment_name: "action_only_corr_only_e0_pi05_libero10_task0"
+
+actor:
+  model:
+    openpi:
+      correction:
+        # E0: 32 anchors only, L = L_corr, no policy batches.
+        anchors_path: "/workspace/workspcae/darc_vla_anchors/anchors_e0.parquet"
+        mode: "only" # "only" => correction-only loader; "mix" (default) => 1:1
+        fixed_eval:
+          interval: 100 # every 100 optimizer steps
+          n_anchors: 32 # same 32 anchors as the training loader
+          seed: 20260812 # fixed flow-matching noise/timestep per anchor
