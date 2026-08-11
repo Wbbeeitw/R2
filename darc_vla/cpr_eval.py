@@ -16,15 +16,22 @@
 
 For every held-out Behavioral Divergence Anchor -- fail observation at frame k,
 success repair action A_c^+ = success[j*], fail action A_c^- = fail[k] --
-sample the policy at o_c^- and measure whether the first predicted action
-lands closer to the success action than to the fail action:
+sample the policy at o_c^- and measure whether the *predicted* action (single
+step and a K-step chunk) lands closer to the success action than to the fail
+action:
 
-    CPR_full = P[ d(A_hat[0], A_c^+) < d(A_hat[0], A_c^-) ]
+    CPR_full          = P[ d(A_hat[0],   A_c^+)        < d(A_hat[0],   A_c^-) ]
+    CPR_chunk_K       = P[ d(A_hat[:K],  A_c^+[:K])    < d(A_hat[:K],  A_c^-[:K]) ]
 
-split into arm (dims 0:6) and gripper (dim 6). Distances are raw-space L2
-over the 7-dim LIBERO action. The Policy wrapper decodes the model output back
-to raw space (Normalize -> model -> Unnormalize), so no normalization math is
-needed on our side -- A_c^+ / A_c^- are the raw values stored in the anchor.
+The headline distance is the *normalized-arm* L2 (raw arm deltas / norm_stats
+action_std over dims 0:6) plus a separately-reported gripper delta (dim 6) --
+raw 7D L2 is dominated by the gripper (LIBERO gripper range ~[-1,1] is 3x the
+arm scale), so raw full-7D CPR is reported for compatibility but not primary.
+Chunk distance is the mean per-step L2 over K steps.
+
+The Policy wrapper decodes the model output back to raw space (Normalize ->
+model -> Unnormalize), so A_c^+ / A_c^- (raw values stored in the anchor) and
+the norm_stats std need no extra transformation.
 
 The policy is loaded exactly like RLinf's standalone eval
 (``toolkits/standalone_eval_scripts/openpi``): ``create_trained_policy`` ->
@@ -48,7 +55,7 @@ Usage (post-trained RLinf SFT ckpt -- auto-converts to openpi deploy format):
       --deploy-out /workspace/workspcae/cpr_deploy \\
       --anchors /workspace/workspcae/darc_vla_anchors/anchors_heldout.parquet \\
       --data-dir /workspace/datasets/recap_libero10_task0/libero10_task0_train \\
-      --out-json /workspace/workspcae/cpr_post.json
+      --num-samples 3 --chunk-k 5 --out-json /workspace/workspcae/cpr_post.json
 """
 
 from __future__ import annotations
@@ -62,6 +69,9 @@ import numpy as np
 import pandas as pd
 
 from darc_vla.corrected_sft_data_loader import _load_task_prompt
+
+_ARM_DIMS = slice(0, 6)
+_GRIP_DIM = 6
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +105,23 @@ def _read_episode_state(data_dir: str, ep: int) -> np.ndarray:
     )
     df = pd.read_parquet(p)
     return np.asarray(df["state"].tolist(), dtype=np.float32)
+
+
+def _read_episode_actions(data_dir: str, ep: int) -> np.ndarray:
+    """[T, 7] raw actions of episode ep (for chunk-K CPR targets)."""
+    p = os.path.join(
+        data_dir, "data", f"chunk-{ep // 1000:03d}", f"episode_{ep:06d}.parquet"
+    )
+    df = pd.read_parquet(p)
+    return np.asarray(df["actions"].tolist(), dtype=np.float32)
+
+
+def _slice_chunk(acts: np.ndarray, start: int, k: int) -> np.ndarray:
+    """[k, 7] chunk starting at `start`, edge-padded at episode end (like the loader)."""
+    chunk = acts[start : start + k]
+    if len(chunk) < k:
+        chunk = np.pad(chunk, ((0, k - len(chunk)), (0, 0)), mode="edge")
+    return chunk
 
 
 def _read_frame(data_dir: str, ep: int, cam: str, idx: int) -> np.ndarray:
@@ -140,52 +167,102 @@ def build_observation(
 
 
 def evaluate(policy, anchors: pd.DataFrame, data_dir: str, prompt: str,
-             num_samples: int, seed: int) -> dict:
+             num_samples: int, seed: int, chunk_k: int = 5,
+             action_std: np.ndarray | None = None) -> dict:
     del seed  # policy sampling is fresh-noise i.i.d. per call; no seeding needed
+    n = len(anchors)
     # per (anchor, sample) distances: [n_anchors, num_samples]
-    d_full_p = np.zeros((len(anchors), num_samples))
-    d_full_m = np.zeros((len(anchors), num_samples))
-    d_arm_p = np.zeros((len(anchors), num_samples))
-    d_arm_m = np.zeros((len(anchors), num_samples))
-    d_gr_p = np.zeros((len(anchors), num_samples))
-    d_gr_m = np.zeros((len(anchors), num_samples))
+    d_full_p = np.zeros((n, num_samples))
+    d_full_m = np.zeros((n, num_samples))
+    d_arm_p = np.zeros((n, num_samples))
+    d_arm_m = np.zeros((n, num_samples))
+    d_gr_p = np.zeros((n, num_samples))
+    d_gr_m = np.zeros((n, num_samples))
+    # normalized-arm single-step (headline per-step metric)
+    d_armn_p = np.zeros((n, num_samples))
+    d_armn_m = np.zeros((n, num_samples))
+    # chunk-level (K steps): raw full and normalized arm
+    d_chunk_p = np.zeros((n, num_samples))
+    d_chunk_m = np.zeros((n, num_samples))
+    d_chunk_armn_p = np.zeros((n, num_samples))
+    d_chunk_armn_m = np.zeros((n, num_samples))
+    inv_std_arm = (
+        (1.0 / action_std[_ARM_DIMS]) if action_std is not None else None
+    )
 
     for i, row in anchors.iterrows():
         fail_ep, k = int(row["fail_episode"]), int(row["k"])
+        suc_ep, j = int(row["success_episode"]), int(row["j_star"])
         a_plus = np.asarray(row["A_c_plus"], dtype=np.float32)    # 7 raw
         a_minus = np.asarray(row["A_c_minus"], dtype=np.float32)  # 7 raw
+        a_plus_chunk = _slice_chunk(
+            _read_episode_actions(data_dir, suc_ep), j, chunk_k
+        )   # [K, 7]
+        a_minus_chunk = _slice_chunk(
+            _read_episode_actions(data_dir, fail_ep), k, chunk_k
+        )   # [K, 7]
         obs = build_observation(data_dir, fail_ep, k, prompt)
 
         for s in range(num_samples):
             policy.reset()
             out = policy.infer(obs)
-            a_hat = np.asarray(out["actions"][0], dtype=np.float32)  # [7] raw
-            if a_hat.shape[0] < 7:
+            acts_out = np.asarray(out["actions"], dtype=np.float32)  # [T, 7] raw
+            if acts_out.ndim != 2 or acts_out.shape[1] < 7:
                 raise RuntimeError(
-                    f"policy returned {a_hat.shape} actions; expected >= 7"
+                    f"policy returned shape {acts_out.shape}; expected [T, >=7]"
                 )
-            a_hat = a_hat[:7]
+            a_hat = acts_out[0, :7]
+            a_chunk = acts_out[:chunk_k, :7]
             diff = a_hat - a_plus
             difm = a_hat - a_minus
             d_full_p[i, s] = np.linalg.norm(diff)
             d_full_m[i, s] = np.linalg.norm(difm)
-            d_arm_p[i, s] = np.linalg.norm(diff[:6])
-            d_arm_m[i, s] = np.linalg.norm(difm[:6])
-            d_gr_p[i, s] = abs(diff[6])
-            d_gr_m[i, s] = abs(difm[6])
+            d_arm_p[i, s] = np.linalg.norm(diff[_ARM_DIMS])
+            d_arm_m[i, s] = np.linalg.norm(difm[_ARM_DIMS])
+            d_gr_p[i, s] = abs(diff[_GRIP_DIM])
+            d_gr_m[i, s] = abs(difm[_GRIP_DIM])
+            if inv_std_arm is not None:
+                d_armn_p[i, s] = np.linalg.norm(diff[_ARM_DIMS] * inv_std_arm)
+                d_armn_m[i, s] = np.linalg.norm(difm[_ARM_DIMS] * inv_std_arm)
+            # chunk distances: mean over K of per-step L2
+            d_chunk_p[i, s] = np.mean(
+                np.linalg.norm(a_chunk - a_plus_chunk, axis=1)
+            )
+            d_chunk_m[i, s] = np.mean(
+                np.linalg.norm(a_chunk - a_minus_chunk, axis=1)
+            )
+            if inv_std_arm is not None:
+                armn_p = (a_chunk[:, :6] - a_plus_chunk[:, :6]) * inv_std_arm
+                armn_m = (a_chunk[:, :6] - a_minus_chunk[:, :6]) * inv_std_arm
+                d_chunk_armn_p[i, s] = np.mean(np.linalg.norm(armn_p, axis=1))
+                d_chunk_armn_m[i, s] = np.mean(np.linalg.norm(armn_m, axis=1))
 
     # pooled over all (anchor, sample) pairs
     return {
-        "n_anchors": len(anchors),
+        "n_anchors": n,
         "n_samples": num_samples,
-        "n_pairs": int(len(anchors) * num_samples),
+        "n_pairs": int(n * num_samples),
+        "chunk_k": chunk_k,
         "cpr_full": float(np.mean(d_full_p < d_full_m)),
         "cpr_arm": float(np.mean(d_arm_p < d_arm_m)),
         "cpr_grip": float(np.mean(d_gr_p < d_gr_m)),
+        "cpr_arm_norm": float(np.mean(d_armn_p < d_armn_m))
+        if inv_std_arm is not None
+        else None,
+        "cpr_chunk_full": float(np.mean(d_chunk_p < d_chunk_m)),
+        "cpr_chunk_arm_norm": float(np.mean(d_chunk_armn_p < d_chunk_armn_m))
+        if inv_std_arm is not None
+        else None,
         "mean_d_plus_full": float(np.mean(d_full_p)),
         "mean_d_minus_full": float(np.mean(d_full_m)),
         "mean_d_plus_arm": float(np.mean(d_arm_p)),
         "mean_d_minus_arm": float(np.mean(d_arm_m)),
+        "mean_d_plus_arm_norm": float(np.mean(d_armn_p))
+        if inv_std_arm is not None
+        else None,
+        "mean_d_minus_arm_norm": float(np.mean(d_armn_m))
+        if inv_std_arm is not None
+        else None,
         "mean_d_plus_grip": float(np.mean(d_gr_p)),
         "mean_d_minus_grip": float(np.mean(d_gr_m)),
     }
@@ -253,6 +330,11 @@ def main() -> None:
     ap.add_argument("--data-dir", required=True)
     ap.add_argument("--num-steps", type=int, default=5)
     ap.add_argument("--num-samples", type=int, default=3)
+    ap.add_argument("--chunk-k", type=int, default=5,
+                    help="chunk-level CPR horizon (CPR_K)")
+    ap.add_argument("--norm-stats", default=None,
+                    help="norm_stats.json for normalized-arm distances; "
+                         "auto-detected under the checkpoint dir when omitted")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out-json", required=True)
     args = ap.parse_args()
@@ -269,6 +351,23 @@ def main() -> None:
     anchors = pd.read_parquet(args.anchors)
     print(f"[cpr] {len(anchors)} anchors; checkpoint dir = {ckpt}")
 
+    # normalized-arm distance: action_std from norm_stats (mean cancels out of
+    # a_hat - a_ref differences, so only std is needed)
+    action_std = None
+    norm_stats_path = args.norm_stats
+    if norm_stats_path is None:
+        cand = os.path.join(
+            ckpt, "physical-intelligence", "libero", "norm_stats.json"
+        )
+        if os.path.isfile(cand):
+            norm_stats_path = cand
+    if norm_stats_path and os.path.isfile(norm_stats_path):
+        ns = json.load(open(norm_stats_path))
+        action_std = np.asarray(ns["actions"]["std"], dtype=np.float32)[:7]
+        print(f"[cpr] normalized-arm distance on {norm_stats_path} (arm std {action_std[:6]})")
+    else:
+        print("[cpr] WARNING: norm_stats.json not found; arm_norm metrics = null")
+
     prompt = _load_task_prompt(args.data_dir, None)
     policy = load_policy(ckpt, num_steps=args.num_steps)
     print("[cpr] policy loaded")
@@ -276,6 +375,7 @@ def main() -> None:
     report = evaluate(
         policy, anchors, args.data_dir, prompt,
         num_samples=args.num_samples, seed=args.seed,
+        chunk_k=args.chunk_k, action_std=action_std,
     )
     report["checkpoint_dir"] = ckpt
     report["anchors_path"] = args.anchors
