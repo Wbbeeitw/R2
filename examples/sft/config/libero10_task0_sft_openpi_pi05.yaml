@@ -1,0 +1,98 @@
+# Gate 0.5 / Stage 0 Base: SFT on libero10_task0_train (RECAP rollout) with the RLinf Pi0.5 LIBERO weights.
+#
+# Data  : /workspace/datasets/recap_libero10_task0/libero10_task0_train
+#         (LeRobot v2.0, panda, 4096 eps, 1 task "put both the alphabet soup and the tomato sauce in the basket")
+# Model : /workspace/models/RLinf-Pi05-LIBERO-SFT  (pi0.5 LIBERO SFT checkpoint, 7.4GB safetensors)
+#
+# NOTE on run_vla_sft.sh: DO NOT use it for runs that write outputs -- it hardcodes
+#   LOG_DIR under the repo root (inside the container that is /workspace/RLinf, i.e. the
+#   read-only source tree). Run the trainer directly and point runner.logger.log_path at
+#   /workspace/workspcae:
+#
+#   cd /workspace/RLinf && \
+#   EMBODIED_PATH=/workspace/RLinf/examples/sft \
+#   LIBERO_REPO_PATH=/opt/venv/openpi/libero \
+#   PYTHONPATH=/workspace/RLinf:/opt/venv/openpi/libero \
+#   /opt/venv/openpi/bin/python examples/sft/train_vla_sft.py \
+#     --config-path examples/sft/config/ \
+#     --config-name libero10_task0_sft_openpi_pi05 \
+#     runner.logger.log_path=/workspace/workspcae/gate0_5/<run-name> \
+#     runner.max_steps=50 runner.save_interval=50 \
+#     actor.optim.total_training_steps=50 actor.optim.lr_warmup_steps=5
+#
+# Values below are Stage-0-scale (3000 steps). The Gate 0.5 smoke overrides them via CLI.
+defaults:
+  - model/pi0@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: 0-0
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "/workspace/workspcae/gate0_5"
+    project_name: rlinf
+    experiment_name: "base_pi05_libero10_task0_train"
+    logger_backends: ["tensorboard"] # wandb, swanlab
+
+  max_epochs: -1
+  max_steps: 3000
+  val_check_interval: -1
+  save_interval: 1000
+
+data:
+  train_data_paths: "/workspace/datasets/recap_libero10_task0/libero10_task0_train"
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 1
+  global_batch_size: 2
+  seed: 0
+
+  # Override the default values in model/pi0
+  model:
+    precision: null
+    model_path: "/workspace/models/RLinf-Pi05-LIBERO-SFT"
+    num_action_chunks: 10 # matches pi05_libero action_horizon=10
+    add_value_head: False
+    openpi:
+      config_name: "pi05_libero" # pi05=True -> matches the Pi0.5 checkpoint architecture
+      detach_critic_input: True
+    # Explicit norm_stats: keeps both get_model and the dataloader pointing at the
+    # checkpoint's own norm_stats.json (asset_id "physical-intelligence/libero").
+    openpi_data:
+      norm_stats_path: "/workspace/models/RLinf-Pi05-LIBERO-SFT/physical-intelligence/libero/norm_stats.json"
+
+  optim:
+    lr: 2.5e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    warmup_style: "cosine"
+    lr_warmup_steps: 1000
+    total_training_steps: 3000 # for lr scheduler cosine decay
+
+  # Override the default values in hybrid_engines/fsdp
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "full_shard"
+    use_orig_params: False
+    gradient_checkpointing: False # for openpi, gradient checkpointing is not supported, please do not change this value
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
