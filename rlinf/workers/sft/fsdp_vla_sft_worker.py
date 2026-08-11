@@ -43,9 +43,24 @@ class FSDPVlaSftWorker(FSDPSftWorker):
                 build_official_openpi_sft_dataloader,
             )
 
-            return build_official_openpi_sft_dataloader(
+            data_loader = build_official_openpi_sft_dataloader(
                 self.cfg, self._world_size, self._rank, data_paths, eval_dataset
             )
+            # DARC-VLA L_corr: mix 1:1 corrected batches (opt-in via
+            # actor.model.openpi.correction). Training only.
+            if (
+                not eval_dataset
+                and getattr(self.cfg.actor.model.openpi, "correction", None)
+                is not None
+            ):
+                from darc_vla.corrected_sft_data_loader import (
+                    build_mixed_sft_dataloader,
+                )
+
+                data_loader = build_mixed_sft_dataloader(
+                    data_loader, self.cfg, data_paths
+                )
+            return data_loader
         elif model_type == SupportedModel.LINGBOTVLA:
             from rlinf.models.embodiment.lingbotvla.sft_builder import (
                 build_lingbot_sft_dataloader,

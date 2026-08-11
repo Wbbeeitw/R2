@@ -1,0 +1,27 @@
+# Stage 0 Action-only + L_corr: frozen VLM, Action Expert trained on
+# L_policy (rollout data) mixed 1:1 with L_corr = FM(o_c^-, A_c^+) on
+# corrected batches (fail observation at anchor k, success action chunk at j*).
+#
+# The corrected batches come from anchors_train.parquet (687 anchors) via
+# darc_vla/corrected_sft_data_loader.py, built by fsdp_vla_sft_worker when
+# actor.model.openpi.correction is set. Effective objective:
+#   L = L_policy + L_corr   (both evaluated on the same FM loss)
+# No model change: L_corr is the identical loss on a different (obs, actions).
+#
+# anchors: /workspace/workspcae/darc_vla_anchors/anchors_train.parquet
+#          (detector v0.4, sameidx persist mode; 687 train anchors)
+defaults:
+  - libero10_task0_action_only_openpi_pi05
+  - _self_
+
+runner:
+  logger:
+    experiment_name: "action_only_corr_pi05_libero10_task0_train"
+
+actor:
+  model:
+    openpi:
+      # Opt-in hook consumed by fsdp_vla_sft_worker.build_dataloader
+      correction:
+        anchors_path: "/workspace/workspcae/darc_vla_anchors/anchors_train.parquet"
+        # data_dir defaults to data.train_data_paths when omitted
