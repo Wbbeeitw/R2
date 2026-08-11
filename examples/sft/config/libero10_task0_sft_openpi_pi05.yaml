@@ -14,13 +14,19 @@
 #   LIBERO_REPO_PATH=/opt/venv/openpi/libero \
 #   PYTHONPATH=/workspace/RLinf:/opt/venv/openpi/libero \
 #   /opt/venv/openpi/bin/python examples/sft/train_vla_sft.py \
-#     --config-path examples/sft/config/ \
+#     --config-path /workspace/RLinf/examples/sft/config/ \
 #     --config-name libero10_task0_sft_openpi_pi05 \
 #     runner.logger.log_path=/workspace/workspcae/gate0_5/<run-name> \
 #     runner.max_steps=50 runner.save_interval=50 \
 #     actor.optim.total_training_steps=50 actor.optim.lr_warmup_steps=5
 #
 # Values below are Stage-0-scale (3000 steps). The Gate 0.5 smoke overrides them via CLI.
+#
+# NOTE: no hydra.searchpath here. That key may only be set in the PRIMARY config, so
+# putting it here breaks the child configs (action_only/state_only/full) that inherit
+# via `defaults: [libero10_task0_sft_openpi_pi05]`. It is also unnecessary: the group
+# configs `model/pi0` and `hybrid_engines/fsdp` live in this same directory and are
+# resolved from the absolute --config-path.
 defaults:
   - model/pi0@actor.model
   - hybrid_engines/fsdp@actor.fsdp_config
@@ -30,8 +36,6 @@ hydra:
   run:
     dir: .
   output_subdir: null
-  searchpath:
-    - file://${oc.env:EMBODIED_PATH}/config/
 
 cluster:
   num_nodes: 1

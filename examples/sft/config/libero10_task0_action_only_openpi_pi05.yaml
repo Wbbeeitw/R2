@@ -16,6 +16,7 @@
 # Stage 0:  runner.max_steps=3000 runner.save_interval=1000 ...
 defaults:
   - libero10_task0_sft_openpi_pi05
+  - _self_ # keep _self_ LAST so this file's overrides win over the inherited base
 
 runner:
   logger:

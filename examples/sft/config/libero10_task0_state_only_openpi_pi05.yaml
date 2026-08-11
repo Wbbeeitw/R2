@@ -13,6 +13,7 @@
 # Intended composition: L_policy + L_state, all params trainable.
 defaults:
   - libero10_task0_sft_openpi_pi05
+  - _self_ # keep _self_ LAST so this file's overrides win over the inherited base
 
 runner:
   logger:

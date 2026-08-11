@@ -11,6 +11,7 @@
 # (VLM trains on the ranking objective; Action Expert on L_policy + L_corr).
 defaults:
   - libero10_task0_sft_openpi_pi05
+  - _self_ # keep _self_ LAST so this file's overrides win over the inherited base
 
 runner:
   logger:
