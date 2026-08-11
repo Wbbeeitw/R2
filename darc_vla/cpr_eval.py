@@ -363,6 +363,10 @@ def main() -> None:
             norm_stats_path = cand
     if norm_stats_path and os.path.isfile(norm_stats_path):
         ns = json.load(open(norm_stats_path))
+        # openpi norm_stats.json nests everything under "norm_stats" (i.e.
+        # {"norm_stats": {"actions": {"std": [...]}, ...}}); tolerate the flat
+        # {"actions": {...}} layout too.
+        ns = ns.get("norm_stats", ns)
         action_std = np.asarray(ns["actions"]["std"], dtype=np.float32)[:7]
         print(f"[cpr] normalized-arm distance on {norm_stats_path} (arm std {action_std[:6]})")
     else:
