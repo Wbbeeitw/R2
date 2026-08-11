@@ -88,6 +88,26 @@ class FSDPSftWorker(FSDPModelManager, Worker):
             self.offload_param_and_grad()
             self.offload_optimizer()
 
+        # Freeze-verification probe (opt-in via actor.verify_frozen_params, e.g. the
+        # action_only ablation config): snapshot the sum of all requires_grad=False
+        # params' data (local shard) at init, then re-check every 10 steps. A nonzero
+        # delta means "frozen" weights are being updated -- catches silent freeze
+        # failures (the previous grad-mask freeze silently trained the VLM; this
+        # probe is what exposed it).
+        self._frozen_probe = None
+        if self.cfg.actor.get("verify_frozen_params", False):
+            try:
+                probe = 0.0
+                for _, p in self.model.named_parameters():
+                    if not p.requires_grad:
+                        probe += float(p.detach().float().sum())
+                self._frozen_probe = probe
+                self._logger.info(
+                    f"[FREEZE_PROBE] init frozen-param data sum = {probe:.6f}"
+                )
+            except Exception as e:  # pragma: no cover
+                self._logger.warning(f"[FREEZE_PROBE] init failed: {e}")
+
     def model_provider_func(self):
         model = get_model(self.cfg.actor.model)
         if model is not None:
@@ -169,6 +189,20 @@ class FSDPSftWorker(FSDPModelManager, Worker):
             # in one step do the optimizer step
             grad_norm, lr_list = self.optimizer_step()
             self.optimizer.zero_grad(set_to_none=True)
+
+            # Freeze-verification probe (opt-in): re-check the frozen-param sum every
+            # 10 steps against the init snapshot.
+            if self._frozen_probe is not None and self.global_step % 10 == 0:
+                cur = 0.0
+                for _, p in self.model.named_parameters():
+                    if not p.requires_grad:
+                        cur += float(p.detach().float().sum())
+                delta = abs(cur - self._frozen_probe)
+                self._logger.info(
+                    f"[FREEZE_PROBE] step {self.global_step} frozen sum={cur:.6f} "
+                    f"delta_vs_init={delta:.9g} -> "
+                    f"{'FROZEN' if delta == 0.0 else '*** CHANGED (FREEZE FAILED) ***'}"
+                )
 
             self.lr_scheduler.step()
             lr_value = self.optimizer.param_groups[0]["lr"]

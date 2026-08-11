@@ -122,20 +122,20 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
     @property
     def _no_split_modules(self) -> list[str]:
-        if self.config.train_expert_only:
-            no_split_modules = [
-                "GemmaDecoderLayer",
-                "SiglipVisionEmbeddings",
-                "GemmaRMSNorm",
-                "GemmaRotaryEmbedding",
-            ]
-        else:
-            no_split_modules = [
-                "GemmaMLP",
-                "SiglipVisionEmbeddings",
-                "GemmaRMSNorm",
-                "GemmaRotaryEmbedding",
-            ]
+        # FSDP wrap granularity (transformer classes to wrap). We deliberately do
+        # NOT branch on train_expert_only here: wrapping whole GemmaDecoderLayers
+        # as single FSDP units (the historical train_expert_only list) crashes
+        # with ViewBackward0 on the first backward under torch 2.7 + FSDP flat
+        # params, independent of the freeze mechanism or graph uniformity; the
+        # finer GemmaMLP granularity is the only layout validated to work
+        # (full-parameter FT SFT, gczx_sim + RLinf PR #568). The VLM freeze
+        # (requires_grad=False, see freeze_vlm) needs no wrap change.
+        no_split_modules = [
+            "GemmaMLP",
+            "SiglipVisionEmbeddings",
+            "GemmaRMSNorm",
+            "GemmaRotaryEmbedding",
+        ]
         if self.config.noise_method == "flow_noise":
             no_split_modules.append("ExploreNoiseNet")
         if self.config.use_rlt:
@@ -359,6 +359,22 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         )
         outputs["actions"] = outputs["actions"][:, : self.config.action_chunk]
         return outputs
+
+    def gradient_checkpointing_disable(self):
+        super().gradient_checkpointing_disable()
+        # The gemma_pytorch in this openpi build force-enables per-layer gradient
+        # checkpointing in training mode whenever gemma_expert.model carries a
+        # `gradient_checkpointing` attribute, which overrides the explicit disable
+        # above and breaks frozen-VLM SFT with a non-reentrant checkpoint
+        # view/inplace version-counter error (gemma_pytorch.py:172 ViewBackward0).
+        # Drop the attribute so the joint forward runs without checkpointing,
+        # matching the upstream RLinf openpi path (gczx_sim fix 67e6ad54).
+        expert_model = self.paligemma_with_expert.gemma_expert.model
+        if hasattr(expert_model, "gradient_checkpointing"):
+            delattr(expert_model, "gradient_checkpointing")
+        backbone = self.paligemma_with_expert
+        if hasattr(backbone, "gradient_checkpointing"):
+            delattr(backbone, "gradient_checkpointing")
 
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
         if forward_type == ForwardType.SFT:
@@ -1403,10 +1419,25 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
     def freeze_vlm(self):
         if self.config.train_expert_only:
-            # Base freeze: paligemma (SigLIP vision encoder + Gemma)
+            # Base freeze: paligemma (SigLIP vision encoder + Gemma). requires_grad=False
+            # + eval() on the RAW model, so FSDP (which must run with use_orig_params=True,
+            # see libero10_task0_action_only_openpi_pi05.yaml) respects per-param
+            # requires_grad: the VLM params never enter the optimizer (build_optimizer
+            # skips requires_grad=False) and autograd prunes them (no grads), so the VLM
+            # is bit-for-bit frozen. This does NOT work under use_orig_params=False: FSDP
+            # packs frozen + trainable params into the same FlatParameter and the optimizer
+            # steps the whole unit, silently training the "frozen" VLM (the previous
+            # grad-mask approach failed exactly this way -- confirmed by diagnostic logs).
             self.paligemma_with_expert.paligemma.eval()
+            n_frozen = 0
             for params in self.paligemma_with_expert.paligemma.parameters():
                 params.requires_grad = False
+                n_frozen += 1
+            n_total = sum(1 for _ in self.parameters())
+            self.logger.info(
+                f"[FREEZE_VLM] requires_grad=False freeze: {n_frozen} VLM params "
+                f"(of {n_total} total) frozen + eval(); gemma_expert stays trainable"
+            )
 
             # ========== DSRL additional freezing ==========
             if self.config.use_dsrl:

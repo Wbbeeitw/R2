@@ -23,6 +23,15 @@ runner:
     experiment_name: "action_only_pi05_libero10_task0_train"
 
 actor:
+  verify_frozen_params: True # FREEZE_PROBE: assert frozen-VLM weights don't change every 10 steps
+  fsdp_config:
+    # REQUIRED for the VLM freeze: with use_orig_params=False (the base config),
+    # FSDP packs frozen + trainable params into the same FlatParameter and the
+    # optimizer steps the whole unit -- the "frozen" VLM would silently be trained
+    # (diagnosed via build_optimizer logs: 0/118 params matched the freeze prefix,
+    # all VLM weights were in the optimizer). use_orig_params=True keeps per-param
+    # requires_grad, which freeze_vlm() sets to False on the VLM.
+    use_orig_params: True
   model:
     openpi:
       train_expert_only: True # freeze VLM -> train Action Expert only
