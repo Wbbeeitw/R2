@@ -224,18 +224,34 @@ def _roll_intervene(env, policy, init_state, C, base_chunk, delta7, alpha,
 
 
 class Critic(nn.Module):
-    """x = [state_C (8), base_chunk (35), delta (7)] -> logit P(R=1|x)."""
+    """x -> logit P(R=1|x).  Dropout on for the small-data diagnostic."""
 
-    def __init__(self, in_dim):
+    def __init__(self, in_dim, dropout=0.0):
         super().__init__()
+        d = lambda: (nn.Dropout(dropout) if dropout > 0 else nn.Identity())
         self.net = nn.Sequential(
-            nn.Linear(in_dim, 128), nn.ReLU(),
-            nn.Linear(128, 128), nn.ReLU(),
+            nn.Linear(in_dim, 128), nn.ReLU(), d(),
+            nn.Linear(128, 128), nn.ReLU(), d(),
             nn.Linear(128, 1),
         )
 
     def forward(self, x):
         return self.net(x).squeeze(-1)
+
+
+def _feat_cols(feat, r):
+    """Build the critic input from a collected row.  --feat selects which
+    features: full (state+base+delta, 50-d), state_delta (15-d), delta (7-d).
+    The 50-d input with ~80 train samples is the likely overfit culprit, so
+    the cheaper feature sets are the small-data diagnostic."""
+    if feat == "full":
+        return np.concatenate([r["state"], r["base_chunk"].reshape(-1),
+                               r["delta"]]).astype(np.float32)
+    if feat == "state_delta":
+        return np.concatenate([r["state"], r["delta"]]).astype(np.float32)
+    if feat == "delta":
+        return np.asarray(r["delta"], dtype=np.float32)
+    raise ValueError(feat)
 
 
 def _auroc(y, scores):
@@ -251,11 +267,11 @@ def _auroc(y, scores):
     return (ranks[y == 1].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
 
 
-def _train_critic(X, y, epochs, lr, wd, seed):
+def _train_critic(X, y, epochs, lr, wd, seed, dropout=0.0):
     torch.manual_seed(seed)
     Xt = torch.tensor(np.asarray(X, dtype=np.float32))
     yt = torch.tensor(np.asarray(y, dtype=np.float32))
-    model = Critic(Xt.shape[1])
+    model = Critic(Xt.shape[1], dropout=dropout)
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
     lossf = nn.BCEWithLogitsLoss()
     model.train()
@@ -413,13 +429,9 @@ def main(args):
     # Phase 2: critic on the train split, evaluated on the eval split
     tr = [r for r in rows if r["in_train"]]
     ev = [r for r in rows if not r["in_train"]]
-    Xtr = np.stack([np.concatenate([r["state"], r["base_chunk"].reshape(-1),
-                                    r["delta"]]).astype(np.float32)
-                    for r in tr])
+    Xtr = np.stack([_feat_cols(args.feat, r) for r in tr])
     ytr = np.asarray([r["R"] for r in tr], dtype=np.float32)
-    Xev = np.stack([np.concatenate([r["state"], r["base_chunk"].reshape(-1),
-                                    r["delta"]]).astype(np.float32)
-                    for r in ev])
+    Xev = np.stack([_feat_cols(args.feat, r) for r in ev])
     yev = np.asarray([r["R"] for r in ev], dtype=np.float32)
 
     mu = Xtr.mean(0)
@@ -427,7 +439,8 @@ def main(args):
     Xtr_s = (Xtr - mu) / sd
     Xev_s = (Xev - mu) / sd
 
-    model = _train_critic(Xtr_s, ytr, args.epochs, args.lr, args.wd, args.seed)
+    model = _train_critic(Xtr_s, ytr, args.epochs, args.lr, args.wd,
+                          args.seed, dropout=args.dropout)
     with torch.no_grad():
         qtr = torch.sigmoid(
             model(torch.tensor(Xtr_s, dtype=torch.float32))).numpy()
@@ -549,6 +562,12 @@ if __name__ == "__main__":
     ap.add_argument("--epochs", type=int, default=400)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--wd", type=float, default=1e-4)
+    ap.add_argument("--dropout", type=float, default=0.0,
+                    help="dropout on the critic MLP (small-data regularization)")
+    ap.add_argument("--feat", default="full",
+                    choices=["full", "state_delta", "delta"],
+                    help="critic input features: full=state+base_chunk+delta "
+                         "(50-d, the default); state_delta=15-d; delta=7-d")
     ap.add_argument("--save-data-npz", default=None,
                     help="checkpoint collected (x,delta,R) tuples here")
     ap.add_argument("--data-npz", default=None,
