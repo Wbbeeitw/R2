@@ -143,7 +143,7 @@ def _roll_ablate(env, policy, init_state, C, mode, alpha, sigma, seed, prompt,
             )
             if mode == "zero":
                 chunk = base_chunk
-            elif mode == "random":
+            elif "random" in mode:
                 delta = sigma * np.random.randn(action_chunk, 7).astype(np.float32)
                 chunk = base_chunk + alpha * np.tanh(delta)
             elif mode == "resample":
