@@ -117,70 +117,50 @@ def _auroc(y, scores):
     return (ranks[y == 1].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
 
 
-def main(args):
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+def _run_fold(rows, meta, args, tr_trials, ev_trials):
+    """Train on tr_trials, evaluate Top-1 success on ev_trials.  Returns
+    (sel_rows, dict) with per-eval-trial selection and pooled aggregates."""
+    tr_rows = [r for r in rows if r["trial"] in tr_trials]
+    ev_rows = [r for r in rows if r["trial"] in ev_trials]
+    if not tr_rows or not ev_rows:
+        return [], {}
 
-    rows, meta = _load_data(args.data_npz)
-    train_trials = [int(t) for t in meta["train_trials"]]
-    eval_trials = [int(t) for t in meta["eval_trials"]]
-    tr_rows = [r for r in rows if r["trial"] in train_trials]
-    ev_rows = [r for r in rows if r["trial"] in eval_trials]
-
-    tr_groups = list(_group(tr_rows).values())
-    ev_groups = list(_group(ev_rows).values())
-    print(f"[rank] train trials {train_trials} ({len(tr_rows)} tuples) | "
-          f"eval trials {eval_trials} ({len(ev_rows)} tuples)")
-    for g in tr_groups + ev_groups:
-        print(f"[rank] trial {g[0]['trial']}: "
-              f"positives {sum(r['R'] for r in g)}/{len(g)} "
-              f"{'TRAIN' if g[0]['trial'] in train_trials else 'EVAL'}")
-
-    # standardize on train only
     ctx_tr = np.stack([_ctx(r) for r in tr_rows])
     delta_tr = np.stack([r["delta"] for r in tr_rows])
     ctx_tr_s, delta_tr_s = _standardize(tr_rows, ctx_tr, delta_tr)
-    ctx_ev_s, delta_ev_s = _standardize(tr_rows,
-                                        np.stack([_ctx(r) for r in ev_rows]),
-                                        np.stack([r["delta"] for r in ev_rows]))
+    ctx_ev_s, delta_ev_s = _standardize(
+        tr_rows, np.stack([_ctx(r) for r in ev_rows]),
+        np.stack([r["delta"] for r in ev_rows]))
+
+    tr_by_trial = {}
+    for i, r in enumerate(tr_rows):
+        tr_by_trial.setdefault(r["trial"], []).append(i)
+    tr_ctx_groups = [ctx_tr_s[tr_by_trial[t]] for t in tr_trials]
+    tr_delta_groups = [delta_tr_s[tr_by_trial[t]] for t in tr_trials]
+    tr_R_groups = [[float(tr_rows[i]["R"]) for i in tr_by_trial[t]]
+                   for t in tr_trials]
 
     model = Compatibility(43, 7, args.emb)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.wd)
     device = "cpu"
-
-    # rebuild train groups from standardized arrays (same order as tr_rows)
-    # group rows by trial in tr_rows order
-    tr_by_trial = {}
-    for i, r in enumerate(tr_rows):
-        tr_by_trial.setdefault(r["trial"], []).append(i)
-    tr_ctx_groups = [ctx_tr_s[tr_by_trial[t]] for t in train_trials]
-    tr_delta_groups = [delta_tr_s[tr_by_trial[t]] for t in train_trials]
-    tr_R_groups = [[float(tr_rows[i]["R"]) for i in tr_by_trial[t]]
-                   for t in train_trials]
-
     model.train()
-    for it in range(args.epochs):
+    for _ in range(args.epochs):
         opt.zero_grad()
         if args.loss == "listwise":
             loss = _loss_listwise_tensors(
                 model, tr_ctx_groups, tr_delta_groups, tr_R_groups,
                 args.margin, args.w_supp, device)
         else:
-            loss, npairs = _loss_pairwise_tensors(
+            loss, _ = _loss_pairwise_tensors(
                 model, tr_ctx_groups, tr_delta_groups, tr_R_groups,
                 args.margin, device)
         loss.backward()
         opt.step()
-        if (it + 1) % max(1, args.epochs // 5) == 0:
-            print(f"[rank] it {it+1} loss {float(loss):.4f}")
-
     model.eval()
 
-    # EVAL: per eval trial, score K proposals, argmax -> Top-1 success.
     rng = np.random.default_rng(args.seed)
-    sel = []
-    y_all, s_all = [], []
-    for t in eval_trials:
+    sel, y_all, s_all = [], [], []
+    for t in ev_trials:
         g = [r for r in ev_rows if r["trial"] == t]
         gi = [i for i, r in enumerate(ev_rows) if r["trial"] == t]
         ctx = torch.tensor(ctx_ev_s[gi])
@@ -202,39 +182,103 @@ def main(args):
                     "botQ_recovery": bot_ok / half})
         y_all.append(R)
         s_all.append(s)
-        print(f"[rank] trial {t}: top1-Q {top1} | random {rand} | "
-              f"min-norm {minnorm} | best-of-K {best}")
-
     y_all = np.concatenate(y_all)
     s_all = np.concatenate(s_all)
-    auroc_ev = _auroc(y_all, s_all)
     n = len(sel)
-    sr_q = sum(s["top1_Q"] for s in sel) / n
-    sr_rand = sum(s["random"] for s in sel) / n
-    sr_min = sum(s["min_norm"] for s in sel) / n
-    sr_best = sum(s["best_of_K"] for s in sel) / n
-    sr_rand_exp = float(y_all.mean())
-    top_pool = sum(s["topQ_recovery"] for s in sel) / n
-    bot_pool = sum(s["botQ_recovery"] for s in sel) / n
-    print(f"[rank] SR_Top1-Q {sr_q:.3f} | SR_Random {sr_rand_exp:.3f} "
-          f"(draw {sr_rand:.3f}) | SR_min-norm {sr_min:.3f} | "
-          f"SR_Best-of-K {sr_best:.3f} | AUROC {auroc_ev:.3f}")
-    print(f"[rank] topQ {top_pool:.3f} vs botQ {bot_pool:.3f}")
-
-    report = {
-        "task": meta.get("task"),
-        "loss": args.loss, "emb": args.emb, "lr": args.lr, "wd": args.wd,
-        "epochs": args.epochs, "margin": args.margin, "w_supp": args.w_supp,
-        "train_trials": train_trials, "eval_trials": eval_trials,
-        "n_train_tuples": len(tr_rows), "n_eval_tuples": len(ev_rows),
-        "auroc_eval": float(auroc_ev),
-        "sr_top1_Q": sr_q, "sr_random": sr_rand_exp,
-        "sr_random_draw": sr_rand, "sr_min_norm": sr_min,
-        "sr_best_of_K": sr_best,
-        "topQ_recovery": top_pool, "botQ_recovery": bot_pool,
-        "selection_rows": sel,
+    agg = {
+        "n_eval_trials": n,
+        "sr_top1_Q": sum(s["top1_Q"] for s in sel) / n if n else None,
+        "sr_random": sum(s["random"] for s in sel) / n if n else None,
+        "sr_min_norm": sum(s["min_norm"] for s in sel) / n if n else None,
+        "sr_best_of_K": sum(s["best_of_K"] for s in sel) / n if n else None,
+        "sr_random_exp": float(y_all.mean()) if len(y_all) else None,
+        "auroc_eval": float(_auroc(y_all, s_all)) if len(y_all) else None,
     }
-    print(json.dumps(report, indent=2))
+    return sel, agg
+
+
+def main(args):
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    rows, meta = _load_data(args.data_npz)
+    train_trials = [int(t) for t in meta["train_trials"]]
+    eval_trials = [int(t) for t in meta["eval_trials"]]
+
+    per_trial = {}
+    for r in rows:
+        per_trial.setdefault(r["trial"], []).append(r)
+
+    print(f"[rank] train trials {train_trials} | eval trials {eval_trials} "
+          f"({args.loss}, emb {args.emb})")
+    for t in sorted(per_trial):
+        g = per_trial[t]
+        pos = sum(r["R"] for r in g)
+        tag = "EVAL" if t in eval_trials else "TRAIN"
+        print(f"[rank] trial {t}: positives {pos}/{len(g)} {tag}")
+
+    if args.cv:
+        # leave-one-train-trial-out: 10 eval points instead of the fixed 3
+        all_sel, all_agg = [], []
+        for hold in train_trials:
+            s, a = _run_fold(rows, meta, args,
+                             [t for t in train_trials if t != hold], [hold])
+            all_sel.extend(s)
+            all_agg.append(a)
+        n = len(all_sel)
+        sr_q = sum(x["top1_Q"] for x in all_sel) / n
+        sr_rand = sum(x["random"] for x in all_sel) / n
+        sr_min = sum(x["min_norm"] for x in all_sel) / n
+        sr_best = sum(x["best_of_K"] for x in all_sel) / n
+        sr_rand_exp = sum(a["sr_random_exp"] for a in all_agg) / len(all_agg)
+        auroc_ev = sum(a["auroc_eval"] for a in all_agg) / len(all_agg)
+        top_pool = sum(x["topQ_recovery"] for x in all_sel) / n
+        bot_pool = sum(x["botQ_recovery"] for x in all_sel) / n
+        print(f"[rank CV] SR_Top1-Q {sr_q:.3f} | SR_Random {sr_rand_exp:.3f} "
+              f"(draw {sr_rand:.3f}) | SR_min-norm {sr_min:.3f} | "
+              f"SR_Best-of-K {sr_best:.3f} | AUROC {auroc_ev:.3f}")
+        print(f"[rank CV] topQ {top_pool:.3f} vs botQ {bot_pool:.3f}")
+        print(f"[rank CV] per-holdout: " + ", ".join(
+            f"{x['trial']}:{'✓' if x['top1_Q'] else '✗'}" for x in all_sel))
+        report = {
+            "mode": "cv", "loss": args.loss, "emb": args.emb,
+            "sr_top1_Q": sr_q, "sr_random": sr_rand_exp,
+            "sr_random_draw": sr_rand, "sr_min_norm": sr_min,
+            "sr_best_of_K": sr_best, "auroc_eval": auroc_ev,
+            "topQ_recovery": top_pool, "botQ_recovery": bot_pool,
+            "selection_rows": all_sel,
+        }
+    else:
+        sel, agg = _run_fold(rows, meta, args, train_trials, eval_trials)
+        for x in sel:
+            print(f"[rank] trial {x['trial']}: top1-Q {x['top1_Q']} | "
+                  f"random {x['random']} | min-norm {x['min_norm']} | "
+                  f"best-of-K {x['best_of_K']}")
+        print(f"[rank] SR_Top1-Q {agg['sr_top1_Q']:.3f} | "
+              f"SR_Random {agg['sr_random_exp']:.3f} "
+              f"(draw {agg['sr_random']:.3f}) | SR_min-norm "
+              f"{agg['sr_min_norm']:.3f} | SR_Best-of-K {agg['sr_best_of_K']:.3f} "
+              f"| AUROC {agg['auroc_eval']:.3f}")
+        top_pool = sum(x["topQ_recovery"] for x in sel) / len(sel)
+        bot_pool = sum(x["botQ_recovery"] for x in sel) / len(sel)
+        print(f"[rank] topQ {top_pool:.3f} vs botQ {bot_pool:.3f}")
+        report = {
+            "mode": "fixed", "loss": args.loss, "emb": args.emb,
+            "train_trials": train_trials, "eval_trials": eval_trials,
+            "sr_top1_Q": agg["sr_top1_Q"], "sr_random": agg["sr_random_exp"],
+            "sr_random_draw": agg["sr_random"], "sr_min_norm": agg["sr_min_norm"],
+            "sr_best_of_K": agg["sr_best_of_K"], "auroc_eval": agg["auroc_eval"],
+            "topQ_recovery": top_pool, "botQ_recovery": bot_pool,
+            "selection_rows": sel,
+        }
+
+    report.update({"task": meta.get("task"),
+                   "n_train_tuples": sum(1 for r in rows if r["trial"]
+                                         in train_trials),
+                   "n_eval_tuples": sum(1 for r in rows if r["trial"]
+                                        in eval_trials)})
+    print(json.dumps({k: v for k, v in report.items()
+                      if k != "selection_rows"}, indent=2))
     with open(args.out_json, "w") as f:
         json.dump(report, f, indent=2)
     print(f"[rank] wrote {args.out_json}")
@@ -292,5 +336,8 @@ if __name__ == "__main__":
     ap.add_argument("--w-supp", type=float, default=0.5,
                     help="weight of suppress-all term for 0-positive contexts")
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--cv", action="store_true",
+                    help="leave-one-train-trial-out CV (10 eval points) "
+                         "instead of the fixed 3-trial holdout")
     ap.add_argument("--out-json", required=True)
     main(ap.parse_args())
