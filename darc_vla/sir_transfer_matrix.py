@@ -219,7 +219,9 @@ def _load_data(path):
             "state": np.asarray(d["state"][i], dtype=np.float32),
             "base_chunk": np.asarray(d["base_chunk"][i], dtype=np.float32),
             "delta": np.asarray(d["delta"][i], dtype=np.float32),
-            "sigma": float(d["sigma"][i]),
+            # npz stores sigma as float32 (0.1 -> 0.10000000149...), so a raw
+            # `== 0.1` (float64) comparison would silently count zero matches.
+            "sigma": float(round(float(d["sigma"][i]), 4)),
             "R": bool(d["R"][i]),
         })
     with open(path.replace(".npz", "_meta.json")) as f:
@@ -339,6 +341,7 @@ def main(args):
     # pooled RR at sigma=0.1 from the collection data
     rr01 = (sum(1 for r in rows if r["sigma"] == 0.1 and r["R"]),
             sum(1 for r in rows if r["sigma"] == 0.1))
+    rr01_rate = rr01[0] / rr01[1] if rr01[1] else 0.0
 
     n_pos_sources = sum(1 for t in sources if diag[t][0])
     print("\n[transfer] matrix rows=source, cols=target ('#'=R=1)")
@@ -351,8 +354,8 @@ def main(args):
     print(f"\n[transfer] off-diagonal PTR = {ptr:.3f} "
           f"({sum(T[i][j] for i, j in off)}/{len(off)})")
     print(f"[transfer] RR(sigma=0.1) from collection = "
-          f"{rr01[0]}/{rr01[1]} = {rr01[0]/rr01[1]:.3f}")
-    print(f"[transfer] PTR - RR_0.1 = {ptr - rr01[0]/rr01[1]:+.3f}")
+          f"{rr01[0]}/{rr01[1]} = {rr01_rate:.3f}")
+    print(f"[transfer] PTR - RR_0.1 = {ptr - rr01_rate:+.3f}")
     print(f"[transfer] source generality G = "
           + ", ".join(f"trial {i}: {G[i]:.3f}" for i in sources))
     print(f"[transfer] target coverability C_j (BestOf7 verified): "
@@ -370,7 +373,7 @@ def main(args):
         print(f"[transfer] BestOf7(verified) - BestOf7(random) = "
               f"{best7_verified - best7_rand:+.3f}")
 
-    gap = ptr - rr01[0] / rr01[1]
+    gap = ptr - rr01_rate
     n_generous = sum(1 for i in sources if G[i] >= 0.40)
     if gap >= 0.15 and n_generous >= 2:
         decision = ("A: transfer >> random with multiple general sources -> "
