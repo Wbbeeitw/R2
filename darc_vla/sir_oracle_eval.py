@@ -289,6 +289,10 @@ def main(args):
             rows.append(row)
             continue
 
+        if args.base_only:
+            rows.append(row)
+            continue
+
         if args.sweep_c:
             per_c = []
             for cf in args.sweep_c:
@@ -431,6 +435,9 @@ if __name__ == "__main__":
                          "mid/late = 0%)")
     ap.add_argument("--frac-early", type=float, default=0.25,
                     help="early-intervention upper fraction of the trajectory")
+    ap.add_argument("--base-only", action="store_true",
+                    help="only run baseline rollouts, no intervention "
+                         "(multi-task base-SR sampling)")
     ap.add_argument("--sweep-c", default=None,
                     help="comma-separated candidate C fractions, e.g. "
                          "\"0.05,0.10,0.15,0.20,0.25\". When set, every "
