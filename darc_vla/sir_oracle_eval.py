@@ -287,8 +287,13 @@ def main(args):
             rows.append(row)
             continue
 
-        # single oracle intervention at a uniform step C
-        C = int(rng.integers(0, max(t_base, 1)))
+        # single oracle intervention; position depends on --intervention-mode
+        hi = (
+            max(int(args.frac_early * t_base), 1)
+            if args.intervention_mode == "early"
+            else max(t_base, 1)
+        )
+        C = int(rng.integers(0, hi))
         ok_or, _ = _roll(
             env, policy, init_states[trial], max_steps, args.num_steps_wait,
             args.action_chunk, pool, args.chunk_k, oracle_C=C,
@@ -334,6 +339,8 @@ def main(args):
         "action_chunk": args.action_chunk,
         "chunk_k": args.chunk_k,
         "oracle_dist": args.oracle_dist,
+        "intervention_mode": args.intervention_mode,
+        "frac_early": args.frac_early,
         "sr_base": sr_base,
         "sr_oracle": sr_oracle,
         "il_oracle": sr_oracle - sr_base,
@@ -373,6 +380,13 @@ if __name__ == "__main__":
     ap.add_argument("--num-steps-wait", type=int, default=10)
     ap.add_argument("--probe-success", action="store_true",
                     help="also run oracle on baseline-success trials (harm rate)")
+    ap.add_argument("--intervention-mode", default="uniform",
+                    choices=["uniform", "early"],
+                    help="uniform: C ~ U(0,T); early: C ~ U(0, frac_early*T) "
+                         "(50-trial result: only early interventions recover, "
+                         "mid/late = 0%)")
+    ap.add_argument("--frac-early", type=float, default=0.25,
+                    help="early-intervention upper fraction of the trajectory")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--out-json", required=True)
     main(ap.parse_args())
