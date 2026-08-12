@@ -243,6 +243,8 @@ def _roll(env, policy, init_state, max_steps, num_steps_wait, action_chunk,
 
 
 def main(args):
+    if args.sweep_c:
+        args.sweep_c = [float(x) for x in args.sweep_c.split(",")]
     rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)
 
@@ -287,6 +289,25 @@ def main(args):
             rows.append(row)
             continue
 
+        if args.sweep_c:
+            per_c = []
+            for cf in args.sweep_c:
+                C = max(int(cf * t_base), 0)
+                ok_or, _ = _roll(
+                    env, policy, init_states[trial], max_steps,
+                    args.num_steps_wait, args.action_chunk, pool, args.chunk_k,
+                    oracle_C=C, seed=seed_r, prompt=prompt,
+                )
+                per_c.append({"c_frac": cf, "C": C, "ok": bool(ok_or)})
+            row["sweep"] = per_c
+            row["oracle"] = any(p["ok"] for p in per_c)
+            if ok_base:
+                row["harm"] = not row["oracle"]
+            else:
+                row["recovery"] = bool(row["oracle"])
+            rows.append(row)
+            continue
+
         # single oracle intervention; position depends on --intervention-mode
         hi = (
             max(int(args.frac_early * t_base), 1)
@@ -324,12 +345,34 @@ def main(args):
     for r in rows:
         if r["recovery"] is None:
             continue
+        if "sweep" in r:  # per-C positions recorded under sweep_stats
+            continue
         p = (r["C"] + 1) / max(r["T"], 1)
         for label, edge in zip(bin_labels, bin_edges):
             if p <= edge:
                 rec_by_bin[label][1] += 1
                 rec_by_bin[label][0] += 1 if r["recovery"] else 0
                 break
+
+    sweep_by_frac = {}
+    n_swept = n_best = 0
+    for r in rows:
+        if "sweep" not in r:
+            continue
+        n_swept += 1
+        if r["recovery"]:
+            n_best += 1
+        for p in r["sweep"]:
+            e = sweep_by_frac.setdefault(p["c_frac"], [0, 0])
+            e[1] += 1
+            e[0] += 1 if p["ok"] else 0
+    sweep_stats = {
+        "n_swept": n_swept,
+        "recovery_best": n_best / n_swept if n_swept else None,
+        "recovery_by_c_frac": {
+            k: tuple(v) for k, v in sorted(sweep_by_frac.items())
+        },
+    }
 
     report = {
         "task": prompt,
@@ -353,6 +396,7 @@ def main(args):
         "recovery_by_progress_bin": {
             b: (rec_by_bin[b][0], rec_by_bin[b][1]) for b in bin_labels
         },
+        "sweep": sweep_stats,
         "rows": rows,
     }
     print(json.dumps({k: v for k, v in report.items() if k != "rows"}, indent=2))
@@ -387,6 +431,13 @@ if __name__ == "__main__":
                          "mid/late = 0%)")
     ap.add_argument("--frac-early", type=float, default=0.25,
                     help="early-intervention upper fraction of the trajectory")
+    ap.add_argument("--sweep-c", default=None,
+                    help="comma-separated candidate C fractions, e.g. "
+                         "\"0.05,0.10,0.15,0.20,0.25\". When set, every "
+                         "baseline-failed trajectory gets ONE oracle "
+                         "intervention at each candidate (same seed => same "
+                         "pre-C trajectory) -> best-of-C upper bound on an "
+                         "oracle anchor")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--out-json", required=True)
     main(ap.parse_args())
