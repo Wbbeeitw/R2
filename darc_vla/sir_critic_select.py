@@ -52,6 +52,8 @@ Phase 1 (collection): for each failed trial, roll deterministically to the
          fixed intervention point C=26, record (state_C, base_chunk); then for
          each of K proposals sample a random delta and run ONE full rollout that
          executes A_C0 + alpha*tanh(delta) at C and hands back to base -> R.
+         The collected (x, delta, R) tuples are checkpointed to --save-data-npz
+         so a later crash only costs the critic/selection stage (--data-npz).
 Phase 2 (critic): train the BCE critic on the TRAIN-split trials; evaluate on
          the held-out EVAL-split trials.
 Phase 3 (selection): on each eval trial, score its K proposals, pick argmax,
@@ -109,7 +111,7 @@ def _state_from_obs(obs):
             _quat2axisangle(obs["robot0_eef_quat"]),
             obs["robot0_gripper_qpos"],
         )
-    )
+    ).astype(np.float32)
 
 
 def _obs(obs, prompt):
@@ -141,7 +143,8 @@ def _get_libero_env(task, resolution, seed):
 def _sample_delta(rng, sigmas):
     """Random 7-D structured residual from a mixed scale set."""
     sigma = float(rng.choice(sigmas))
-    return sigma * rng.standard_normal(7).astype(np.float32), sigma
+    delta = sigma * rng.standard_normal(7)  # NumPy2: float*float32 -> float64
+    return delta.astype(np.float32), sigma
 
 
 def _roll_to_C(env, policy, init_state, C, num_steps_wait, action_chunk,
@@ -265,89 +268,158 @@ def _train_critic(X, y, epochs, lr, wd, seed):
     return model
 
 
+def _save_data(path, rows, meta):
+    """Checkpoint collected (x, delta, R) tuples so critic/selection can be
+    re-run without recollecting (the expensive part)."""
+    rec = {
+        "trial": np.asarray([r["trial"] for r in rows], dtype=np.int64),
+        "in_train": np.asarray([r["in_train"] for r in rows], dtype=bool),
+        "state": np.stack([r["state"] for r in rows]),
+        "base_chunk": np.stack([r["base_chunk"].reshape(-1) for r in rows]),
+        "delta": np.stack([r["delta"] for r in rows]),
+        "sigma": np.asarray([r["sigma"] for r in rows], dtype=np.float32),
+        "R": np.asarray([r["R"] for r in rows], dtype=bool),
+    }
+    np.savez(path, **rec)
+    with open(path.replace(".npz", "_meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"[critic] saved data -> {path} ({len(rows)} tuples)")
+
+
+def _load_data(path):
+    """Restore tuples + meta from a --save-data-npz checkpoint."""
+    d = np.load(path)
+    n = len(d["trial"])
+    rows = []
+    for i in range(n):
+        rows.append({
+            "trial": int(d["trial"][i]),
+            "in_train": bool(d["in_train"][i]),
+            "state": np.asarray(d["state"][i], dtype=np.float32),
+            "base_chunk": np.asarray(d["base_chunk"][i], dtype=np.float32),
+            "delta": np.asarray(d["delta"][i], dtype=np.float32),
+            "sigma": float(d["sigma"][i]),
+            "R": bool(d["R"][i]),
+        })
+    with open(path.replace(".npz", "_meta.json")) as f:
+        meta = json.load(f)
+    return rows, meta
+
+
 def main(args):
     rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)
 
-    suite = benchmark.get_benchmark_dict()[args.task_suite_name]()
-    task = suite.get_task(args.task_id)
-    prompt = task.language
-    env = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
-    init_states = suite.get_task_init_states(args.task_id)
-    max_steps = args.max_steps or _MAX_STEPS_BY_SUITE[args.task_suite_name]
-    print(
-        f"[critic] task {args.task_id}: {prompt!r} | C={args.c} | "
-        f"max_steps {max_steps} | alpha {args.alpha} | sigmas {args.sigmas}"
-    )
-
-    from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
-    from toolkits.standalone_eval_scripts.openpi import create_trained_policy
-
-    cfg = get_openpi_config(
-        args.config_name, model_path=args.pretrained_path, batch_size=1
-    )
-    policy = create_trained_policy(
-        cfg, args.pretrained_path, sample_kwargs={"num_steps": args.num_steps}
-    )
-    print("[critic] policy loaded")
-
-    # Phase 0: base probes
-    base_seed = args.seed
-    n_trials = min(args.num_trials, len(init_states))
-    trials_fail = []
-    n_ok = 0
-    for trial in tqdm.tqdm(range(n_trials), desc="base probes"):
-        seed_r = base_seed * 10000 + trial
-        ok = _roll_intervene(
-            env, policy, init_states[trial], C=-1, base_chunk=None, delta7=None,
-            alpha=0.0, seed=seed_r, prompt=prompt, max_steps=max_steps,
-            num_steps_wait=args.num_steps_wait, action_chunk=args.action_chunk,
+    if args.data_npz:
+        rows, meta = _load_data(args.data_npz)
+        train_trials = [int(t) for t in meta["train_trials"]]
+        eval_trials = [int(t) for t in meta["eval_trials"]]
+        n_ok = int(meta["base_ok"])
+        n_trials = int(meta["n_trials"])
+        print(f"[critic] resumed from {args.data_npz}: {len(rows)} tuples | "
+              f"train {train_trials} | eval {eval_trials}")
+    else:
+        suite = benchmark.get_benchmark_dict()[args.task_suite_name]()
+        task = suite.get_task(args.task_id)
+        prompt = task.language
+        env = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
+        init_states = suite.get_task_init_states(args.task_id)
+        max_steps = args.max_steps or _MAX_STEPS_BY_SUITE[args.task_suite_name]
+        print(
+            f"[critic] task {args.task_id}: {prompt!r} | C={args.c} | "
+            f"max_steps {max_steps} | alpha {args.alpha} | sigmas {args.sigmas}"
         )
-        if ok:
-            n_ok += 1
-        else:
-            trials_fail.append(trial)
-    print(f"[critic] base SR {n_ok}/{n_trials}; failed trials {trials_fail}")
-    if len(trials_fail) < args.n_eval + 1:
-        print("[critic] too few failed trials for a meaningful split; aborting")
-        env.close()
-        return
 
-    eval_trials = trials_fail[-args.n_eval:]
-    train_trials = trials_fail[:-args.n_eval]
-    print(f"[critic] train trials {train_trials} | eval trials {eval_trials}")
+        from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
+        from toolkits.standalone_eval_scripts.openpi import create_trained_policy
 
-    # Phase 1: collection -- for every failed trial, K executed proposals
-    K = args.k
-    rows = []
-    for trial in tqdm.tqdm(trials_fail, desc="collection"):
-        seed_r = base_seed * 10000 + trial
-        state_C, base_chunk = _roll_to_C(
-            env, policy, init_states[trial], args.c, args.num_steps_wait,
-            args.action_chunk, seed_r, prompt,
+        cfg = get_openpi_config(
+            args.config_name, model_path=args.pretrained_path, batch_size=1
         )
-        for _ in range(K):
-            delta, sigma = _sample_delta(rng, args.sigmas)
-            R = _roll_intervene(
-                env, policy, init_states[trial], args.c, base_chunk, delta,
-                args.alpha, seed_r, prompt, max_steps, args.num_steps_wait,
-                args.action_chunk,
+        policy = create_trained_policy(
+            cfg, args.pretrained_path, sample_kwargs={"num_steps": args.num_steps}
+        )
+        print("[critic] policy loaded")
+
+        # Phase 0: base probes
+        base_seed = args.seed
+        n_trials = min(args.num_trials, len(init_states))
+        trials_fail = []
+        n_ok = 0
+        for trial in tqdm.tqdm(range(n_trials), desc="base probes"):
+            seed_r = base_seed * 10000 + trial
+            ok = _roll_intervene(
+                env, policy, init_states[trial], C=-1, base_chunk=None,
+                delta7=None, alpha=0.0, seed=seed_r, prompt=prompt,
+                max_steps=max_steps, num_steps_wait=args.num_steps_wait,
+                action_chunk=args.action_chunk,
             )
-            rows.append({
-                "trial": trial, "in_train": trial in train_trials,
-                "state": state_C, "base_chunk": base_chunk, "delta": delta,
-                "sigma": sigma, "R": bool(R),
-            })
-    env.close()
+            if ok:
+                n_ok += 1
+            else:
+                trials_fail.append(trial)
+        print(f"[critic] base SR {n_ok}/{n_trials}; failed trials {trials_fail}")
+        if len(trials_fail) < args.n_eval + 1:
+            print("[critic] too few failed trials for a meaningful split; aborting")
+            env.close()
+            return
+
+        eval_trials = trials_fail[-args.n_eval:]
+        train_trials = trials_fail[:-args.n_eval]
+        print(f"[critic] train trials {train_trials} | eval trials {eval_trials}")
+
+        # Phase 1: collection -- for every failed trial, K executed proposals
+        K = args.k
+        rows = []
+        for trial in tqdm.tqdm(trials_fail, desc="collection"):
+            seed_r = base_seed * 10000 + trial
+            state_C, base_chunk = _roll_to_C(
+                env, policy, init_states[trial], args.c, args.num_steps_wait,
+                args.action_chunk, seed_r, prompt,
+            )
+            for _ in range(K):
+                delta, sigma = _sample_delta(rng, args.sigmas)
+                R = _roll_intervene(
+                    env, policy, init_states[trial], args.c, base_chunk, delta,
+                    args.alpha, seed_r, prompt, max_steps, args.num_steps_wait,
+                    args.action_chunk,
+                )
+                rows.append({
+                    "trial": trial, "in_train": trial in train_trials,
+                    "state": state_C, "base_chunk": base_chunk, "delta": delta,
+                    "sigma": sigma, "R": bool(R),
+                })
+        env.close()
+
+        meta = {
+            "task": prompt,
+            "task_suite": args.task_suite_name,
+            "task_id": args.task_id,
+            "C": args.c,
+            "alpha": args.alpha,
+            "sigmas": [float(s) for s in args.sigmas],
+            "K": K,
+            "max_steps": max_steps,
+            "seed": args.seed,
+            "base_ok": n_ok,
+            "n_trials": n_trials,
+            "trials_fail": trials_fail,
+            "train_trials": train_trials,
+            "eval_trials": eval_trials,
+        }
+        if args.save_data_npz:
+            _save_data(args.save_data_npz, rows, meta)
 
     # Phase 2: critic on the train split, evaluated on the eval split
     tr = [r for r in rows if r["in_train"]]
     ev = [r for r in rows if not r["in_train"]]
     Xtr = np.stack([np.concatenate([r["state"], r["base_chunk"].reshape(-1),
-                                    r["delta"]]) for r in tr])
+                                    r["delta"]]).astype(np.float32)
+                    for r in tr])
     ytr = np.asarray([r["R"] for r in tr], dtype=np.float32)
     Xev = np.stack([np.concatenate([r["state"], r["base_chunk"].reshape(-1),
-                                    r["delta"]]) for r in ev])
+                                    r["delta"]]).astype(np.float32)
+                    for r in ev])
     yev = np.asarray([r["R"] for r in ev], dtype=np.float32)
 
     mu = Xtr.mean(0)
@@ -357,8 +429,10 @@ def main(args):
 
     model = _train_critic(Xtr_s, ytr, args.epochs, args.lr, args.wd, args.seed)
     with torch.no_grad():
-        qtr = torch.sigmoid(model(torch.tensor(Xtr_s))).numpy()
-        qev = torch.sigmoid(model(torch.tensor(Xev_s))).numpy()
+        qtr = torch.sigmoid(
+            model(torch.tensor(Xtr_s, dtype=torch.float32))).numpy()
+        qev = torch.sigmoid(
+            model(torch.tensor(Xev_s, dtype=torch.float32))).numpy()
 
     auroc_tr = _auroc(ytr, qtr)
     auroc_ev = _auroc(yev, qev)
@@ -368,13 +442,12 @@ def main(args):
     sel = []
     for trial in eval_trials:
         rt = [r for r in ev if r["trial"] == trial]
-        qs = qev[[r for r in range(len(ev)) if ev[r]["trial"] == trial]]
+        qs = qev[[i for i in range(len(ev)) if ev[i]["trial"] == trial]]
         idx = int(np.argmax(qs))
         q_best = bool(rt[idx]["R"])
         r_rand = rng.integers(0, len(rt))
         rand = bool(rt[r_rand]["R"])
         best = any(r["R"] for r in rt)
-        # top-Q vs bottom-Q halves (tie-aware)
         order = np.argsort(qs, kind="mergesort")[::-1]
         half = max(1, len(order) // 2)
         top_ok = sum(1 for i in order[:half] if rt[int(i)]["R"])
@@ -394,8 +467,7 @@ def main(args):
     sr_qsel = sum(s["Q_select"] for s in sel) / n_ev
     sr_rand = sum(s["random"] for s in sel) / n_ev
     sr_best = sum(s["best_of_K"] for s in sel) / n_ev
-    # expected Random@1 = mean over all eval candidates (more stable)
-    sr_rand_exp = float(yev.mean())
+    sr_rand_exp = float(yev.mean())  # expected Random@1 over all eval candidates
     top_pool = sum(s["topQ_recovery"] for s in sel) / n_ev
     bot_pool = sum(s["botQ_recovery"] for s in sel) / n_ev
     print(
@@ -406,19 +478,19 @@ def main(args):
     print(f"[critic] topQ {top_pool:.3f} vs botQ {bot_pool:.3f}")
 
     report = {
-        "task": prompt,
-        "task_suite": args.task_suite_name,
-        "task_id": args.task_id,
-        "C": args.c,
-        "alpha": args.alpha,
-        "sigmas": args.sigmas,
-        "K": K,
-        "max_steps": max_steps,
-        "seed": args.seed,
+        "task": meta["task"],
+        "task_suite": meta["task_suite"],
+        "task_id": meta["task_id"],
+        "C": meta["C"],
+        "alpha": meta["alpha"],
+        "sigmas": meta["sigmas"],
+        "K": meta["K"],
+        "max_steps": meta["max_steps"],
+        "seed": meta["seed"],
         "base_sr": n_ok / n_trials,
-        "n_base_fail": len(trials_fail),
-        "train_trials": train_trials,
-        "eval_trials": eval_trials,
+        "n_base_fail": len(meta["trials_fail"]),
+        "train_trials": meta["train_trials"],
+        "eval_trials": meta["eval_trials"],
         "n_train_tuples": len(tr),
         "n_eval_tuples": len(ev),
         "auroc_train": float(auroc_tr),
@@ -435,7 +507,7 @@ def main(args):
                 int(sum(1 for r in rows if r["sigma"] == s and r["R"])),
                 int(sum(1 for r in rows if r["sigma"] == s)),
             )
-            for s in args.sigmas
+            for s in meta["sigmas"]
         },
         "selection_rows": sel,
         "rows": [
@@ -477,6 +549,11 @@ if __name__ == "__main__":
     ap.add_argument("--epochs", type=int, default=400)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--wd", type=float, default=1e-4)
+    ap.add_argument("--save-data-npz", default=None,
+                    help="checkpoint collected (x,delta,R) tuples here")
+    ap.add_argument("--data-npz", default=None,
+                    help="resume from a --save-data-npz checkpoint (skips "
+                         "collection; critic + selection only)")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--out-json", required=True)
     main(ap.parse_args())
