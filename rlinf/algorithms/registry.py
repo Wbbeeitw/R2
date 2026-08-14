@@ -112,9 +112,17 @@ def calculate_adv_and_returns(**kwargs) -> tuple[torch.Tensor, Optional[torch.Te
             kwargs = preprocess_embodied_advantages_inputs(**kwargs)
             if adv_type != "gae":
                 kwargs = calculate_scores(**kwargs)
-            advantages, returns = fn(**kwargs)
+            ret = fn(**kwargs)
+            modified_loss_mask = None
+            if isinstance(ret, tuple) and len(ret) == 3:
+                advantages, returns, modified_loss_mask = ret
+            else:
+                advantages, returns = ret
             res = postprocess_embodied_advantages_outputs(
-                advantages=advantages, returns=returns, **kwargs
+                advantages=advantages,
+                returns=returns,
+                modified_loss_mask=modified_loss_mask,
+                **kwargs,
             )
     else:
         # reasoning tasks

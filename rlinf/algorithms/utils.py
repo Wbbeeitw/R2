@@ -165,6 +165,7 @@ def postprocess_embodied_advantages_outputs(
     num_chunk: int,
     chunk_size: int,
     returns: Optional[torch.Tensor] = None,
+    modified_loss_mask: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> dict:
     """
@@ -178,6 +179,12 @@ def postprocess_embodied_advantages_outputs(
     if returns is not None:
         returns = returns.reshape(num_chunk, chunk_size, -1).transpose(1, 2)
         res.update({"returns": returns})
+
+    if modified_loss_mask is not None:
+        modified_loss_mask = modified_loss_mask.reshape(
+            num_chunk, chunk_size, -1
+        ).transpose(1, 2)
+        res.update({"loss_mask": modified_loss_mask})
 
     return res
 

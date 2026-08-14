@@ -126,6 +126,7 @@ def compute_grpo_degen_advantages(
     rewards: torch.Tensor,
     loss_mask: torch.Tensor,
     group_size: int,
+    degen_mode: str = "prefix",
     **kwargs,
 ):
     """Compute GRPO advantages with degeneracy-triggered reward shaping.
@@ -145,21 +146,42 @@ def compute_grpo_degen_advantages(
     - all-failure: rank by conservative valid-prefix length — the earliest
       suspicious action chunk (from the per-step `suspicious` boundary flags)
       minus a one-chunk safety margin. Unlocalized trajectories (no boundary
-      detected) get zero credit rather than being forced to a full prefix.
+      detected) get zero credit (宁缺毋滥) rather than being forced to a full
+      prefix.
+
+    The all-failure treatment has two modes (`degen_mode`):
+
+    - "prefix" (default, main method): temporal cut. The min-max failure ranking
+      is broadcast only to the clean prefix `t < f_i`; actions after the
+      boundary get advantage 0 and are zeroed out of the returned loss mask, so
+      they never enter the policy-gradient denominator. Ranking is min-max so
+      the worst localized failure gets r=0 and the best gets r=1 (no negative
+      advantage for short prefixes).
+    - "ranking": ablation. The same min-max failure ranking, but broadcast over
+      the whole trajectory with no temporal cut (loss mask returned unchanged).
 
     Args:
         rewards: Per-trajectory scores. Shape [num_groups, group_size].
         loss_mask: Loss mask for valid entries. Shape [n_steps, bsz].
         group_size: Group size for advantage computation.
+        degen_mode: "prefix" (default) or "ranking".
         dones: (in kwargs) Done flags. Shape [n_steps + 1, bsz].
         suspicious: (in kwargs) Per-chunk boundary flags. Shape [n_steps, bsz].
 
     Returns:
-        torch.Tensor: advantages
+        Tuple[advantages, None, loss_mask]: the third element is the (possibly
+        prefix-masked) loss mask, so the caller can propagate the temporal cut
+        into the policy-gradient denominator.
     """
     eps = 1e-6
-    grouped_rewards = rewards.view(-1, group_size)  # [num_groups, group_size]
+    n_steps, bsz = loss_mask.shape
+    num_groups = bsz // group_size
+    device = loss_mask.device
 
+    # Per-trajectory valid length (loss mask is 1 up to the first done step).
+    T_i = loss_mask.sum(dim=0).clamp(min=1).float()  # [bsz]
+
+    grouped_rewards = rewards.view(num_groups, group_size)  # [num_groups, group_size]
     group_mean = grouped_rewards.mean(dim=-1, keepdim=True)
     group_std = grouped_rewards.std(dim=-1, keepdim=True)
     vanilla = (grouped_rewards - group_mean) / (group_std + eps)
@@ -167,66 +189,88 @@ def compute_grpo_degen_advantages(
     # Degenerate groups (std == 0): the vanilla advantage is identically zero.
     degenerate = group_std.squeeze(-1) < eps  # [num_groups]
     all_success = degenerate & (group_mean.squeeze(-1) > 0)
+    all_failure = degenerate & (group_mean.squeeze(-1) <= 0)
 
-    # Completion-efficiency ranking for all-success groups. A success step sets
-    # `dones` to 1, so the first done index is the completion step; earlier is
-    # better. The score itself carries no timing signal (all successes score the
-    # same), which is exactly why vanilla GRPO degenerates here.
-    completion = torch.zeros_like(grouped_rewards)
+    # Per-trajectory scalar advantage (mixed keeps vanilla) and clean-prefix
+    # length (full valid length unless a failure boundary is cut).
+    traj_adv = vanilla.view(-1)  # [bsz]
+    prefix_len = T_i.clone()  # [bsz]
+
+    # --- all-success: completion-efficiency ranking ---
+    # A success step sets `dones` to 1, so the first done index is the
+    # completion step; earlier is better. The score carries no timing signal
+    # (all successes score the same), which is exactly why vanilla degenerates.
     dones = kwargs.get("dones", None)
-    if dones is not None and all_success.any():
-        n_steps = dones.shape[0] - 1  # dones is [n_steps + 1, bsz]
+    if all_success.any() and dones is not None:
+        n_steps_d = dones.shape[0] - 1  # dones is [n_steps + 1, bsz]
         dones_bool = dones.bool()
         first_done = dones_bool.float().argmax(dim=0)  # [bsz]
         any_done = dones_bool.any(dim=0)
         first_done = torch.where(
-            any_done, first_done, torch.full_like(first_done, n_steps)
+            any_done, first_done, torch.full_like(first_done, n_steps_d)
         )
-        completion_step = first_done.float().view(-1, group_size)  # [num_groups, group_size]
+        completion_step = first_done.float().view(num_groups, group_size)
         max_step = completion_step.max(dim=-1, keepdim=True).values
         efficiency = max_step - completion_step  # earlier completion -> larger
         eff_mean = efficiency.mean(dim=-1, keepdim=True)
         eff_std = efficiency.std(dim=-1, keepdim=True)
         completion = (efficiency - eff_mean) / (eff_std + eps)
+        success_mask = all_success.repeat_interleave(group_size)  # [bsz]
+        traj_adv = torch.where(success_mask, completion.view(-1), traj_adv)
 
-    # all-failure: rank by conservative valid-prefix length (earliest suspicious
-    # action chunk minus a one-chunk safety margin). Unlocalized trajectories
-    # (no boundary found) get zero credit (宁缺毋滥): they are excluded from the
-    # localized members' normalization rather than being forced to a full prefix.
-    all_failure = degenerate & (group_mean.squeeze(-1) <= 0)
-    boundary = torch.zeros_like(grouped_rewards)
+    # --- all-failure: min-max boundary ranking (+ temporal cut in prefix mode) ---
     suspicious = kwargs.get("suspicious", None)
-    if suspicious is not None and all_failure.any():
+    if all_failure.any() and suspicious is not None:
         susp_bool = suspicious.bool()  # [n_steps, bsz]
         first_susp = susp_bool.float().argmax(dim=0)  # [bsz]; 0 if never suspicious
-        any_susp = susp_bool.any(dim=0)  # [bsz]
-        f = (first_susp.float() - 1).clamp(min=1).view(-1, group_size)
-        unlocalized = (~any_susp).view(-1, group_size)
+        localized = susp_bool.any(dim=0)  # [bsz]
+        # Conservative boundary: one chunk safety margin before the first
+        # suspicious action chunk.
+        f_i = (first_susp.float() - 1).clamp(min=1)  # [bsz]
 
-        credit = torch.where(unlocalized, torch.zeros_like(f), f)
-        n_loc = (~unlocalized).float().sum(dim=-1, keepdim=True).clamp(min=1)
-        loc_mean = credit.sum(dim=-1, keepdim=True) / n_loc
-        sq = (credit - loc_mean) ** 2
-        loc_var = torch.where(unlocalized, torch.zeros_like(sq), sq).sum(
-            dim=-1, keepdim=True
-        ) / n_loc
-        loc_std = loc_var.sqrt()
-        boundary = torch.where(
-            unlocalized,
-            torch.zeros_like(credit),
-            (credit - loc_mean) / (loc_std + eps),
-        )
+        # Quality = clean-prefix fraction of the trajectory; unlocalized -> 0.
+        q_i = torch.where(localized, f_i / T_i, torch.zeros_like(f_i))  # [bsz]
+        q_g = q_i.view(num_groups, group_size)
+        loc_g = localized.view(num_groups, group_size)
 
-    # mixed -> vanilla; all-success -> completion efficiency; all-failure -> boundary.
-    grouped_adv = torch.where(
-        all_success.unsqueeze(-1),
-        completion,
-        torch.where(all_failure.unsqueeze(-1), boundary, vanilla),
+        # Min-max over localized members only (unlocalized excluded from the
+        # normalization, 宁缺毋滥).
+        q_min = torch.where(
+            loc_g, q_g, torch.full_like(q_g, float("inf"))
+        ).min(dim=-1, keepdim=True).values
+        q_max = torch.where(
+            loc_g, q_g, torch.full_like(q_g, float("-inf"))
+        ).max(dim=-1, keepdim=True).values
+
+        r_g = (q_g - q_min) / (q_max - q_min + eps)
+        # No spread among localized members -> reinforce the common boundary.
+        no_spread = (q_max - q_min) < eps
+        r_g = torch.where(no_spread, torch.ones_like(r_g), r_g)
+        # Unlocalized get zero credit.
+        r_g = torch.where(loc_g, r_g, torch.zeros_like(r_g))
+
+        r_i = r_g.view(-1)  # [bsz]
+        failure_mask = all_failure.repeat_interleave(group_size)  # [bsz]
+
+        traj_adv = torch.where(failure_mask, r_i, traj_adv)
+        if degen_mode == "prefix":
+            # Cut the loss mask at the failure boundary for localized failures.
+            prefix_len = torch.where(failure_mask & localized, f_i, prefix_len)
+
+    # Broadcast the per-trajectory advantage over time, then apply the temporal
+    # cut (prefix_len == T_i everywhere except localized failures in prefix
+    # mode, so mixed/success/unlocalized-failure keep the full valid region).
+    t_idx = torch.arange(n_steps, device=device, dtype=prefix_len.dtype).unsqueeze(-1)
+    prefix_mask = t_idx < prefix_len.unsqueeze(0)  # [n_steps, bsz]
+
+    advantages = (
+        traj_adv.unsqueeze(0).expand(n_steps, bsz)
+        * loss_mask.float()
+        * prefix_mask.float()
     )
+    ff_loss_mask = loss_mask.bool() & prefix_mask
 
-    advantages = (torch.zeros_like(loss_mask) + grouped_adv.view(1, -1)) * loss_mask
-
-    return advantages, None
+    return advantages, None, ff_loss_mask
 
 
 @register_advantage("grpo_dynamic")

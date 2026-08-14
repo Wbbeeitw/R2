@@ -1316,6 +1316,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "gamma": self.cfg.algorithm.get("gamma", 1),
             "gae_lambda": self.cfg.algorithm.get("gae_lambda", 1),
             "group_size": self.cfg.algorithm.get("group_size", 8),
+            "degen_mode": self.cfg.algorithm.get("degen_mode", "prefix"),
             "reward_type": self.cfg.algorithm.reward_type,
             "loss_mask": self.rollout_batch.get("loss_mask", None),
             "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
@@ -1324,7 +1325,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
 
         self.rollout_batch.update(advantages_and_returns)
-        if kwargs["loss_mask"] is not None:
+        # grpo_degen may return a prefix-masked loss_mask; do not clobber it
+        # with the original. Other adv types don't return one, so fall back.
+        if "loss_mask" not in advantages_and_returns and kwargs["loss_mask"] is not None:
             self.rollout_batch.update({"loss_mask": kwargs["loss_mask"]})
         if kwargs["loss_mask_sum"] is not None:
             self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
