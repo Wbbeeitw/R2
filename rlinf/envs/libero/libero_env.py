@@ -209,7 +209,12 @@ class LiberoEnv(gym.Env):
         self._boundary_lift_margin = float(cfg.get("boundary_lift_margin", 0.05))
         self._boundary_ws_x = float(cfg.get("boundary_ws_x", 0.6))
         self._boundary_ws_y = float(cfg.get("boundary_ws_y", 0.6))
-        self._boundary_ws_z_min = float(cfg.get("boundary_ws_z_min", 0.6))
+        # Out-of-workspace along z is judged relative to each object's reset
+        # height: an object counts as dropped out of the workspace when its z
+        # falls this far below its init z. (An absolute z floor would be wrong —
+        # LIBERO tabletops sit at ~0.46-0.48 m, so a fixed 0.6 m threshold would
+        # flag every resting object as out-of-workspace.)
+        self._boundary_ws_drop_margin = float(cfg.get("boundary_ws_drop_margin", 0.15))
 
         self._init_metrics()
         self._elapsed_steps = np.zeros(self.num_envs, dtype=np.int32)
@@ -486,7 +491,13 @@ class LiberoEnv(gym.Env):
                 }
             )
             ooi, all_objs = _parse_bddl_objects(final_path)
-            goal_objects.append(ooi[0] if ooi else (all_objs[0] if all_objs else None))
+            # Track every object of interest, not just the first: for tasks
+            # where the destination (plate/basket/stove) is listed before the
+            # manipulated object, ooi[0] would be a container that is never
+            # grasped, silently zeroing the boundary coverage. Aggregating over
+            # all of them lets drop/lift land on whichever object is actually
+            # picked up (containers never contribute grasped/lifted).
+            goal_objects.append(ooi if ooi else all_objs)
             # LIBERO-PRO: use selected BDDL language (not original suite task.language)
             # and remember the perturbation folder for pruned_init loading.
             pert_folder = os.path.basename(os.path.dirname(os.path.abspath(final_path)))
@@ -754,7 +765,7 @@ class LiberoEnv(gym.Env):
         # Conservative failure-boundary tracking (per-env, reset across episodes).
         self._prev_grasped = np.zeros(self.num_envs, dtype=bool)
         self._prev_lifted = np.zeros(self.num_envs, dtype=bool)
-        self._target_init_z = np.zeros(self.num_envs)
+        self._target_init_z: list[dict] = [{} for _ in range(self.num_envs)]
         self._last_step_suspicious = np.zeros(self.num_envs, dtype=bool)
 
     def _reset_metrics(self, env_idx=None):
@@ -808,46 +819,54 @@ class LiberoEnv(gym.Env):
     def _compute_suspicious(self, raw_obs):
         """Per-env conservative failure-boundary flag for the current substep.
 
-        Emits ``True`` when the target object (``obj_of_interest``) shows a
-        failure signature this substep:
+        Emits ``True`` when any object of interest shows a failure signature
+        this substep:
 
-        - drop: was grasped last substep, no longer grasped now
-        - lift regression: was lifted last substep, no longer lifted now
-        - out-of-workspace: object position left the table bounds
+        - drop: some object was grasped last substep, none is grasped now
+        - lift regression: some object was lifted last substep, none is now
+        - out-of-workspace: some object left the table bounds
 
-        The per-env ``_prev_grasped`` / ``_prev_lifted`` state is updated in
-        place, so this must be called exactly once per substep, in order.
+        Grasp/lift state is tracked as an env-level aggregate over all objects
+        of interest (``any-object-grasped`` / ``any-object-lifted``), so a
+        container that is never picked up never contributes a signal, while a
+        dropped target object does. ``_prev_grasped`` / ``_prev_lifted`` are
+        updated in place and must be called exactly once per substep, in order.
         """
         suspicious = np.zeros(self.num_envs, dtype=bool)
         goal_objects = getattr(self, "_goal_objects", None)
         if goal_objects is None:
             return suspicious
         for i in range(self.num_envs):
-            target = goal_objects[i]
-            if target is None:
+            objects = goal_objects[i]
+            if not objects:
                 continue
             obs = raw_obs[i]
-            to_eef_key = f"{target}_to_robot0_eef_pos"
-            pos_key = f"{target}_pos"
-            if to_eef_key not in obs or pos_key not in obs:
-                continue
-            dist = float(np.linalg.norm(np.asarray(obs[to_eef_key]).reshape(-1)))
-            pos = np.asarray(obs[pos_key]).reshape(-1)
-            z = float(pos[2])
-            grasped = dist < self._boundary_grasp_thresh
-            lifted = z > self._target_init_z[i] + self._boundary_lift_margin
+            grasped_any = False
+            lifted_any = False
+            out_ws = False
+            for target in objects:
+                to_eef_key = f"{target}_to_robot0_eef_pos"
+                pos_key = f"{target}_pos"
+                if to_eef_key not in obs or pos_key not in obs:
+                    continue
+                dist = float(np.linalg.norm(np.asarray(obs[to_eef_key]).reshape(-1)))
+                pos = np.asarray(obs[pos_key]).reshape(-1)
+                z = float(pos[2])
+                init_z = self._target_init_z[i].get(target, z)
+                grasped_any = grasped_any or (dist < self._boundary_grasp_thresh)
+                lifted_any = lifted_any or (z > init_z + self._boundary_lift_margin)
+                out_ws = out_ws or (
+                    abs(float(pos[0])) > self._boundary_ws_x
+                    or abs(float(pos[1])) > self._boundary_ws_y
+                    or z < init_z - self._boundary_ws_drop_margin
+                )
 
-            drop = self._prev_grasped[i] and not grasped
-            lift_regress = self._prev_lifted[i] and not lifted
-            out_ws = (
-                abs(float(pos[0])) > self._boundary_ws_x
-                or abs(float(pos[1])) > self._boundary_ws_y
-                or z < self._boundary_ws_z_min
-            )
+            drop = self._prev_grasped[i] and not grasped_any
+            lift_regress = self._prev_lifted[i] and not lifted_any
             suspicious[i] = drop or lift_regress or out_ws
 
-            self._prev_grasped[i] = grasped
-            self._prev_lifted[i] = lifted
+            self._prev_grasped[i] = grasped_any
+            self._prev_lifted[i] = lifted_any
         return suspicious
 
     def _extract_image_and_state(self, obs):
@@ -954,12 +973,13 @@ class LiberoEnv(gym.Env):
         goal_objects = getattr(self, "_goal_objects", None)
         for i, idx in enumerate(env_idx):
             self.current_raw_obs[idx] = raw_obs[i]
-            if goal_objects is not None and goal_objects[idx] is not None:
-                pos_key = f"{goal_objects[idx]}_pos"
-                if pos_key in raw_obs[i]:
-                    self._target_init_z[idx] = float(
-                        np.asarray(raw_obs[i][pos_key]).reshape(-1)[2]
-                    )
+            if goal_objects is not None and goal_objects[idx]:
+                for obj in goal_objects[idx]:
+                    pos_key = f"{obj}_pos"
+                    if pos_key in raw_obs[i]:
+                        self._target_init_z[idx][obj] = float(
+                            np.asarray(raw_obs[i][pos_key]).reshape(-1)[2]
+                        )
 
         obs = self._wrap_obs(self.current_raw_obs)
         self._reset_metrics(env_idx)
