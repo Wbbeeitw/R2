@@ -121,6 +121,80 @@ def compute_grpo_advantages(
     return advantages, None
 
 
+@register_advantage("grpo_degen")
+def compute_grpo_degen_advantages(
+    rewards: torch.Tensor,
+    loss_mask: torch.Tensor,
+    group_size: int,
+    **kwargs,
+):
+    """Compute GRPO advantages with degeneracy-triggered reward shaping.
+
+    Vanilla GRPO collapses to zero advantage whenever a group's reward std is
+    zero (every trajectory scored identically). For sparse-reward VLA tasks this
+    is the common case: an all-success group (every score == max) and an
+    all-failure group (every score == 0) both have std == 0, so the model gets
+    no gradient even though "which success finished sooner" and "which failure
+    got further" are both informative.
+
+    This variant leaves mixed groups (std > 0) untouched, and only recovers a
+    relative ranking from trajectory structure when a group degenerates:
+
+    - all-success: rank by completion efficiency (earlier completion wins),
+      derived from the first `done` step in the available `dones` tensor.
+    - all-failure: conservative valid-prefix length (NOT yet implemented; needs
+      simulator predicates for where the trajectory went wrong). Falls back to
+      zero advantage (no gradient) until Phase 2.
+
+    Args:
+        rewards: Per-trajectory scores. Shape [num_groups, group_size].
+        loss_mask: Loss mask for valid entries. Shape [n_steps, bsz].
+        group_size: Group size for advantage computation.
+        dones: (in kwargs) Done flags. Shape [n_steps + 1, bsz].
+
+    Returns:
+        torch.Tensor: advantages
+    """
+    eps = 1e-6
+    grouped_rewards = rewards.view(-1, group_size)  # [num_groups, group_size]
+
+    group_mean = grouped_rewards.mean(dim=-1, keepdim=True)
+    group_std = grouped_rewards.std(dim=-1, keepdim=True)
+    vanilla = (grouped_rewards - group_mean) / (group_std + eps)
+
+    # Degenerate groups (std == 0): the vanilla advantage is identically zero.
+    degenerate = group_std.squeeze(-1) < eps  # [num_groups]
+    all_success = degenerate & (group_mean.squeeze(-1) > 0)
+
+    # Completion-efficiency ranking for all-success groups. A success step sets
+    # `dones` to 1, so the first done index is the completion step; earlier is
+    # better. The score itself carries no timing signal (all successes score the
+    # same), which is exactly why vanilla GRPO degenerates here.
+    completion = torch.zeros_like(grouped_rewards)
+    dones = kwargs.get("dones", None)
+    if dones is not None and all_success.any():
+        n_steps = dones.shape[0] - 1  # dones is [n_steps + 1, bsz]
+        dones_bool = dones.bool()
+        first_done = dones_bool.float().argmax(dim=0)  # [bsz]
+        any_done = dones_bool.any(dim=0)
+        first_done = torch.where(
+            any_done, first_done, torch.full_like(first_done, n_steps)
+        )
+        completion_step = first_done.float().view(-1, group_size)  # [num_groups, group_size]
+        max_step = completion_step.max(dim=-1, keepdim=True).values
+        efficiency = max_step - completion_step  # earlier completion -> larger
+        eff_mean = efficiency.mean(dim=-1, keepdim=True)
+        eff_std = efficiency.std(dim=-1, keepdim=True)
+        completion = (efficiency - eff_mean) / (eff_std + eps)
+
+    # mixed -> vanilla; all-success -> completion efficiency; all-failure -> 0.
+    grouped_adv = torch.where(all_success.unsqueeze(-1), completion, vanilla)
+
+    advantages = (torch.zeros_like(loss_mask) + grouped_adv.view(1, -1)) * loss_mask
+
+    return advantages, None
+
+
 @register_advantage("grpo_dynamic")
 def compute_grpo_dynamic_advantages(
     rewards: torch.Tensor,
