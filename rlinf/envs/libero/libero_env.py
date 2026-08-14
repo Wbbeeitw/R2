@@ -76,6 +76,37 @@ def _read_bddl_language_and_goal(bddl_path: str):
     return language, goal
 
 
+def _parse_bddl_objects(bddl_path: str):
+    """Parse ``(:objects ...)`` and ``(:obj_of_interest ...)`` from a BDDL file.
+
+    Returns ``(obj_of_interest, all_objects)`` as lists of object names. The
+    ``(:objects ...)`` block interleaves ``name - type`` tokens, so every token
+    immediately following a ``-`` is a type name and is dropped.
+    """
+    try:
+        with open(bddl_path, "r", encoding="utf-8") as f:
+            bddl_text = f.read()
+    except OSError:
+        return [], []
+
+    ooi_m = re.search(r"\(:obj_of_interest\s+([^)]+)\)", bddl_text)
+    obj_of_interest = ooi_m.group(1).split() if ooi_m else []
+
+    all_objects = []
+    objects_m = re.search(r"\(:objects\s+([^)]+)\)", bddl_text)
+    if objects_m:
+        skip_next = False
+        for token in objects_m.group(1).split():
+            if token == "-":
+                skip_next = True
+                continue
+            if skip_next:
+                skip_next = False
+                continue
+            all_objects.append(token)
+    return obj_of_interest, all_objects
+
+
 libero_type = get_libero_type()
 
 if libero_type in ["pro", "plus"]:
@@ -170,6 +201,15 @@ class LiberoEnv(gym.Env):
         self.prev_step_reward = np.zeros(self.num_envs)
         self.use_rel_reward = cfg.use_rel_reward
         self.use_step_penalty = getattr(cfg, "use_step_penalty", False)
+
+        # Conservative failure-boundary thresholds (meters). Object-to-gripper
+        # distance below `boundary_grasp_thresh` counts as "grasped"; object z
+        # above its reset height by `boundary_lift_margin` counts as "lifted".
+        self._boundary_grasp_thresh = float(cfg.get("boundary_grasp_thresh", 0.06))
+        self._boundary_lift_margin = float(cfg.get("boundary_lift_margin", 0.05))
+        self._boundary_ws_x = float(cfg.get("boundary_ws_x", 0.6))
+        self._boundary_ws_y = float(cfg.get("boundary_ws_y", 0.6))
+        self._boundary_ws_z_min = float(cfg.get("boundary_ws_z_min", 0.6))
 
         self._init_metrics()
         self._elapsed_steps = np.zeros(self.num_envs, dtype=np.int32)
@@ -288,6 +328,7 @@ class LiberoEnv(gym.Env):
 
         task_descriptions = []
         pert_init_folders = []
+        goal_objects = []
         if env_idx is None:
             env_idx = np.arange(self.num_envs)
 
@@ -302,6 +343,11 @@ class LiberoEnv(gym.Env):
                     self._pert_init_folders[env_id]
                     if hasattr(self, "_pert_init_folders")
                     else ""
+                )
+                goal_objects.append(
+                    self._goal_objects[env_id]
+                    if hasattr(self, "_goal_objects")
+                    else None
                 )
                 continue
 
@@ -439,6 +485,8 @@ class LiberoEnv(gym.Env):
                     "seed": self.seed,
                 }
             )
+            ooi, all_objs = _parse_bddl_objects(final_path)
+            goal_objects.append(ooi[0] if ooi else (all_objs[0] if all_objs else None))
             # LIBERO-PRO: use selected BDDL language (not original suite task.language)
             # and remember the perturbation folder for pruned_init loading.
             pert_folder = os.path.basename(os.path.dirname(os.path.abspath(final_path)))
@@ -464,6 +512,7 @@ class LiberoEnv(gym.Env):
 
         self.task_descriptions = task_descriptions
         self._pert_init_folders = pert_init_folders
+        self._goal_objects = goal_objects
         return env_fn_params
 
     def _compute_total_num_group_envs(self):
@@ -702,6 +751,11 @@ class LiberoEnv(gym.Env):
         self.success_episode_len = np.zeros(self.num_envs, dtype=np.int32)
         self._task_success_stats: dict[int, dict[str, int]] = {}
         self._eval_seen_trials: set[tuple[int, int]] = set()
+        # Conservative failure-boundary tracking (per-env, reset across episodes).
+        self._prev_grasped = np.zeros(self.num_envs, dtype=bool)
+        self._prev_lifted = np.zeros(self.num_envs, dtype=bool)
+        self._target_init_z = np.zeros(self.num_envs)
+        self._last_step_suspicious = np.zeros(self.num_envs, dtype=bool)
 
     def _reset_metrics(self, env_idx=None):
         if env_idx is not None:
@@ -713,6 +767,8 @@ class LiberoEnv(gym.Env):
             self.returns[mask] = 0
             self.success_episode_len[mask] = 0
             self._elapsed_steps[env_idx] = 0
+            self._prev_grasped[mask] = False
+            self._prev_lifted[mask] = False
         else:
             self.prev_step_reward[:] = 0
             self.success_once[:] = False
@@ -720,6 +776,8 @@ class LiberoEnv(gym.Env):
             self.returns[:] = 0.0
             self.success_episode_len[:] = 0
             self._elapsed_steps[:] = 0
+            self._prev_grasped[:] = False
+            self._prev_lifted[:] = False
 
     def _record_metrics(self, step_reward, terminations, infos):
         episode_info = {}
@@ -746,6 +804,51 @@ class LiberoEnv(gym.Env):
         )
         infos["episode"] = to_tensor(episode_info)
         return infos
+
+    def _compute_suspicious(self, raw_obs):
+        """Per-env conservative failure-boundary flag for the current substep.
+
+        Emits ``True`` when the target object (``obj_of_interest``) shows a
+        failure signature this substep:
+
+        - drop: was grasped last substep, no longer grasped now
+        - lift regression: was lifted last substep, no longer lifted now
+        - out-of-workspace: object position left the table bounds
+
+        The per-env ``_prev_grasped`` / ``_prev_lifted`` state is updated in
+        place, so this must be called exactly once per substep, in order.
+        """
+        suspicious = np.zeros(self.num_envs, dtype=bool)
+        goal_objects = getattr(self, "_goal_objects", None)
+        if goal_objects is None:
+            return suspicious
+        for i in range(self.num_envs):
+            target = goal_objects[i]
+            if target is None:
+                continue
+            obs = raw_obs[i]
+            to_eef_key = f"{target}_to_robot0_eef_pos"
+            pos_key = f"{target}_pos"
+            if to_eef_key not in obs or pos_key not in obs:
+                continue
+            dist = float(np.linalg.norm(np.asarray(obs[to_eef_key]).reshape(-1)))
+            pos = np.asarray(obs[pos_key]).reshape(-1)
+            z = float(pos[2])
+            grasped = dist < self._boundary_grasp_thresh
+            lifted = z > self._target_init_z[i] + self._boundary_lift_margin
+
+            drop = self._prev_grasped[i] and not grasped
+            lift_regress = self._prev_lifted[i] and not lifted
+            out_ws = (
+                abs(float(pos[0])) > self._boundary_ws_x
+                or abs(float(pos[1])) > self._boundary_ws_y
+                or z < self._boundary_ws_z_min
+            )
+            suspicious[i] = drop or lift_regress or out_ws
+
+            self._prev_grasped[i] = grasped
+            self._prev_lifted[i] = lifted
+        return suspicious
 
     def _extract_image_and_state(self, obs):
         return {
@@ -848,8 +951,15 @@ class LiberoEnv(gym.Env):
             )
         if self.current_raw_obs is None:
             self.current_raw_obs = [None] * self.num_envs
+        goal_objects = getattr(self, "_goal_objects", None)
         for i, idx in enumerate(env_idx):
             self.current_raw_obs[idx] = raw_obs[i]
+            if goal_objects is not None and goal_objects[idx] is not None:
+                pos_key = f"{goal_objects[idx]}_pos"
+                if pos_key in raw_obs[i]:
+                    self._target_init_z[idx] = float(
+                        np.asarray(raw_obs[i][pos_key]).reshape(-1)[2]
+                    )
 
         obs = self._wrap_obs(self.current_raw_obs)
         self._reset_metrics(env_idx)
@@ -897,6 +1007,7 @@ class LiberoEnv(gym.Env):
         self._elapsed_steps += 1
         raw_obs, _reward, terminations, info_lists = self.env.step(actions)
         self.current_raw_obs = raw_obs
+        self._last_step_suspicious = self._compute_suspicious(raw_obs)
         infos = list_of_dict_to_dict_of_list(info_lists)
         truncations = self.elapsed_steps >= self.cfg.max_episode_steps
         obs = self._wrap_obs(raw_obs)
@@ -927,6 +1038,7 @@ class LiberoEnv(gym.Env):
         infos_list = []
 
         chunk_rewards = []
+        chunk_suspicious = []
 
         raw_chunk_terminations = []
         raw_chunk_truncations = []
@@ -939,10 +1051,14 @@ class LiberoEnv(gym.Env):
             infos_list.append(infos)
 
             chunk_rewards.append(step_reward)
+            chunk_suspicious.append(self._last_step_suspicious.copy())
             raw_chunk_terminations.append(terminations)
             raw_chunk_truncations.append(truncations)
 
         chunk_rewards = torch.stack(chunk_rewards, dim=1)  # [num_envs, chunk_steps]
+        chunk_suspicious = torch.stack(
+            [to_tensor(s) for s in chunk_suspicious], dim=1
+        )  # [num_envs, chunk_steps] bool
         raw_chunk_terminations = torch.stack(
             raw_chunk_terminations, dim=1
         )  # [num_envs, chunk_steps]
@@ -985,6 +1101,7 @@ class LiberoEnv(gym.Env):
             chunk_terminations,
             chunk_truncations,
             infos_list,
+            chunk_suspicious,
         )
 
     def _handle_auto_reset(self, dones, _final_obs, infos):

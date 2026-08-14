@@ -142,15 +142,17 @@ def compute_grpo_degen_advantages(
 
     - all-success: rank by completion efficiency (earlier completion wins),
       derived from the first `done` step in the available `dones` tensor.
-    - all-failure: conservative valid-prefix length (NOT yet implemented; needs
-      simulator predicates for where the trajectory went wrong). Falls back to
-      zero advantage (no gradient) until Phase 2.
+    - all-failure: rank by conservative valid-prefix length — the earliest
+      suspicious action chunk (from the per-step `suspicious` boundary flags)
+      minus a one-chunk safety margin. Unlocalized trajectories (no boundary
+      detected) get zero credit rather than being forced to a full prefix.
 
     Args:
         rewards: Per-trajectory scores. Shape [num_groups, group_size].
         loss_mask: Loss mask for valid entries. Shape [n_steps, bsz].
         group_size: Group size for advantage computation.
         dones: (in kwargs) Done flags. Shape [n_steps + 1, bsz].
+        suspicious: (in kwargs) Per-chunk boundary flags. Shape [n_steps, bsz].
 
     Returns:
         torch.Tensor: advantages
@@ -187,8 +189,40 @@ def compute_grpo_degen_advantages(
         eff_std = efficiency.std(dim=-1, keepdim=True)
         completion = (efficiency - eff_mean) / (eff_std + eps)
 
-    # mixed -> vanilla; all-success -> completion efficiency; all-failure -> 0.
-    grouped_adv = torch.where(all_success.unsqueeze(-1), completion, vanilla)
+    # all-failure: rank by conservative valid-prefix length (earliest suspicious
+    # action chunk minus a one-chunk safety margin). Unlocalized trajectories
+    # (no boundary found) get zero credit (宁缺毋滥): they are excluded from the
+    # localized members' normalization rather than being forced to a full prefix.
+    all_failure = degenerate & (group_mean.squeeze(-1) <= 0)
+    boundary = torch.zeros_like(grouped_rewards)
+    suspicious = kwargs.get("suspicious", None)
+    if suspicious is not None and all_failure.any():
+        susp_bool = suspicious.bool()  # [n_steps, bsz]
+        first_susp = susp_bool.float().argmax(dim=0)  # [bsz]; 0 if never suspicious
+        any_susp = susp_bool.any(dim=0)  # [bsz]
+        f = (first_susp.float() - 1).clamp(min=1).view(-1, group_size)
+        unlocalized = (~any_susp).view(-1, group_size)
+
+        credit = torch.where(unlocalized, torch.zeros_like(f), f)
+        n_loc = (~unlocalized).float().sum(dim=-1, keepdim=True).clamp(min=1)
+        loc_mean = credit.sum(dim=-1, keepdim=True) / n_loc
+        sq = (credit - loc_mean) ** 2
+        loc_var = torch.where(unlocalized, torch.zeros_like(sq), sq).sum(
+            dim=-1, keepdim=True
+        ) / n_loc
+        loc_std = loc_var.sqrt()
+        boundary = torch.where(
+            unlocalized,
+            torch.zeros_like(credit),
+            (credit - loc_mean) / (loc_std + eps),
+        )
+
+    # mixed -> vanilla; all-success -> completion efficiency; all-failure -> boundary.
+    grouped_adv = torch.where(
+        all_success.unsqueeze(-1),
+        completion,
+        torch.where(all_failure.unsqueeze(-1), boundary, vanilla),
+    )
 
     advantages = (torch.zeros_like(loss_mask) + grouped_adv.view(1, -1)) * loss_mask
 

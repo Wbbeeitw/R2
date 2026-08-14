@@ -1308,6 +1308,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "adv_type": self.cfg.algorithm.adv_type,
             "rewards": self.rollout_batch["rewards"],
             "dones": self.rollout_batch["dones"],
+            "suspicious": self.rollout_batch.pop("suspicious", None),
             "values": self.rollout_batch.get("prev_values", None),
             "prev_logprobs": self.rollout_batch.get("prev_logprobs", None),
             "teacher_logprobs": self.rollout_batch.get("teacher_logprobs", None),

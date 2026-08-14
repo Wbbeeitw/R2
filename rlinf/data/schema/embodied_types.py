@@ -47,6 +47,7 @@ class EnvOutput:
     terminations: Optional[torch.Tensor] = None  # [B]
     truncations: Optional[torch.Tensor] = None  # [B]
     rewards: Optional[torch.Tensor] = None  # [B]
+    suspicious: Optional[torch.Tensor] = None  # [B, chunk_steps] per-substep boundary-flag
     env_infos: Optional[dict[str, Any]] = None
 
     intervene_actions: Optional[torch.Tensor] = None  # [B]
@@ -73,6 +74,11 @@ class EnvOutput:
         )
         self.rewards = (
             self.rewards.cpu().contiguous() if self.rewards is not None else None
+        )
+        self.suspicious = (
+            self.suspicious.cpu().contiguous()
+            if self.suspicious is not None
+            else None
         )
         self.env_infos = (
             put_tensor_device(self.env_infos, "cpu")
@@ -217,6 +223,9 @@ class EnvOutput:
             terminations=_merge_optional_tensor_field("terminations"),
             truncations=_merge_optional_tensor_field("truncations"),
             rewards=_merge_optional_tensor_field("rewards"),
+            suspicious=_merge_optional_tensor_field(
+                "suspicious", allow_partial_none=True, fill_value=False
+            ),
             intervene_actions=_merge_optional_tensor_field(
                 "intervene_actions", allow_partial_none=True, fill_value=0.0
             ),
@@ -240,6 +249,7 @@ class EnvOutput:
             "terminations": self.terminations,
             "truncations": self.truncations,
             "rewards": self.rewards,
+            "suspicious": self.suspicious,
             "env_infos": self.env_infos,
             "intervene_actions": self.intervene_actions,
             "intervene_flags": self.intervene_flags,
@@ -352,6 +362,7 @@ class ChunkStepResult:
     truncations: torch.Tensor = None  # [B, 1]
     terminations: torch.Tensor = None  # [B, 1]
     rewards: torch.Tensor = None  # [B, 1]
+    suspicious: torch.Tensor = None  # [B, chunk_steps] per-substep boundary-flag
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
     versions: torch.Tensor = None  # [B, 1]
 
@@ -370,6 +381,8 @@ class ChunkStepResult:
             self.truncations = self.truncations.cpu().contiguous()
         if self.rewards is not None:
             self.rewards = self.rewards.cpu().contiguous()
+        if self.suspicious is not None:
+            self.suspicious = self.suspicious.cpu().contiguous()
         if self.forward_inputs:
             self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
         if self.versions is not None:
@@ -387,6 +400,7 @@ class Trajectory:
     actions: torch.Tensor = None
     intervene_flags: torch.Tensor = None
     rewards: torch.Tensor = None
+    suspicious: torch.Tensor = None
     terminations: torch.Tensor = None
     truncations: torch.Tensor = None
     dones: torch.Tensor = None

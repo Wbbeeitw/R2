@@ -48,6 +48,7 @@ class EmbodiedTrajectoryBuilder:
         default_factory=list
     )  # trajectory_length
     rewards: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
+    suspicious: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
     terminations: list[torch.Tensor] = field(
         default_factory=list
     )  # trajectory_length + rollout_epoch
@@ -77,6 +78,8 @@ class EmbodiedTrajectoryBuilder:
             )
         if result.rewards is not None:
             self.rewards.append(result.rewards)
+        if result.suspicious is not None:
+            self.suspicious.append(result.suspicious)
         if result.terminations is not None:
             self.terminations.append(result.terminations)
         if result.truncations is not None:
@@ -163,6 +166,7 @@ class EmbodiedTrajectoryBuilder:
         self.actions.clear()
         self.intervene_flags.clear()
         self.rewards.clear()
+        self.suspicious.clear()
         self.terminations.clear()
         self.truncations.clear()
         self.dones.clear()
@@ -185,6 +189,10 @@ class EmbodiedTrajectoryBuilder:
             )
         if len(self.rewards) > 0:
             trajectory.rewards = torch.stack(self.rewards, dim=0).cpu().contiguous()
+        if len(self.suspicious) > 0:
+            trajectory.suspicious = (
+                torch.stack(self.suspicious, dim=0).cpu().contiguous()
+            )
         if len(self.terminations) > 0:
             trajectory.terminations = (
                 torch.stack(self.terminations, dim=0).cpu().contiguous()

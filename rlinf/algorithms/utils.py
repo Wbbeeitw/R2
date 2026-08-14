@@ -76,11 +76,14 @@ def preprocess_embodied_advantages_inputs(
     Preprocess inputs before computing advantages & returns.
     Unify names & formats, align with math interfaces.
     """
+    suspicious = kwargs.get("suspicious", None)
     if kwargs["reward_type"] == "chunk_level":
         # TODO: need check
         # rewards, dones, loss_mask, loss_mask_sum: [n_chunk_steps, bsz, num_action_chunks] -> [n_chunk_steps, bsz, 1]
         rewards = rewards.sum(dim=-1, keepdim=True)
         dones = dones.max(dim=-1, keepdim=True)[0]
+        if suspicious is not None:
+            suspicious = suspicious.max(dim=-1, keepdim=True)[0]
         if loss_mask is not None:
             loss_mask = loss_mask.max(dim=-1, keepdim=True)[0]
         if loss_mask_sum is not None:
@@ -101,6 +104,10 @@ def preprocess_embodied_advantages_inputs(
     # Reshape -> [n_steps, bsz]
     # Rewards [n_steps, bsz]
     rewards = rewards.transpose(1, 2).reshape(n_steps, bsz)
+
+    # Suspicious (per-chunk boundary flags) [n_steps, bsz]
+    if suspicious is not None:
+        suspicious = suspicious.transpose(1, 2).reshape(n_steps, bsz)
 
     # Loss Mask (T steps) [bsz, n_steps]
     if loss_mask is not None:
@@ -125,6 +132,7 @@ def preprocess_embodied_advantages_inputs(
             "values": values,
             "loss_mask": loss_mask,
             "loss_mask_sum": loss_mask_sum,
+            "suspicious": suspicious,
         }
     )
 

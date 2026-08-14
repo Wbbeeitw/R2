@@ -476,9 +476,14 @@ class EnvWorker(Worker):
             chunk_actions = exec_actions
         env_info = {}
 
-        obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list = (
-            self.env_list[stage_id].chunk_step(chunk_actions)
-        )
+        (
+            obs_list,
+            chunk_rewards,
+            chunk_terminations,
+            chunk_truncations,
+            infos_list,
+            chunk_suspicious,
+        ) = self.env_list[stage_id].chunk_step(chunk_actions)
         if isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
         if isinstance(infos_list, (list, tuple)):
@@ -526,6 +531,7 @@ class EnvWorker(Worker):
             obs=extracted_obs,
             final_obs=final_obs,
             rewards=chunk_rewards,
+            suspicious=chunk_suspicious,
             env_infos=infos if isinstance(infos, dict) else None,
             dones=chunk_dones,
             terminations=chunk_terminations,
@@ -561,9 +567,14 @@ class EnvWorker(Worker):
         )
         env_info = {}
 
-        obs_list, _, chunk_terminations, chunk_truncations, infos_list = (
-            self.eval_env_list[stage_id].chunk_step(chunk_actions)
-        )
+        (
+            obs_list,
+            _,
+            chunk_terminations,
+            chunk_truncations,
+            infos_list,
+            _,
+        ) = self.eval_env_list[stage_id].chunk_step(chunk_actions)
         if isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
         if isinstance(infos_list, (list, tuple)):
@@ -1112,6 +1123,7 @@ class EnvWorker(Worker):
                         truncations=env_output.truncations,
                         terminations=env_output.terminations,
                         rewards=rewards,
+                        suspicious=env_output.suspicious,
                     )
 
                     self.trajectory_builders[stage_id].append_step_result(
@@ -1246,6 +1258,7 @@ class EnvWorker(Worker):
                     truncations=env_output.truncations,
                     terminations=env_output.terminations,
                     rewards=rewards,
+                    suspicious=env_output.suspicious,
                 )
                 self.trajectory_builders[stage_id].append_step_result(chunk_step_result)
                 if (
@@ -1428,6 +1441,7 @@ class EnvWorker(Worker):
             "adv_type": self.cfg.algorithm.adv_type,
             "rewards": rollout_batch["rewards"],
             "dones": rollout_batch["dones"],
+            "suspicious": rollout_batch.pop("suspicious", None),
             "values": rollout_batch.get("prev_values", None),
             "prev_logprobs": rollout_batch.get("prev_logprobs", None),
             "num_action_chunks": self.cfg.actor.model.num_action_chunks,
