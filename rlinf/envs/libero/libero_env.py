@@ -767,6 +767,9 @@ class LiberoEnv(gym.Env):
         self._prev_lifted = np.zeros(self.num_envs, dtype=bool)
         self._target_init_z: list[dict] = [{} for _ in range(self.num_envs)]
         self._last_step_suspicious = np.zeros(self.num_envs, dtype=bool)
+        # Whether this episode ever flagged a failure-boundary signal (diagnostic
+        # coverage metric; mirrors `success_once` / `fail_once`).
+        self.suspicious_once = np.zeros(self.num_envs, dtype=bool)
 
     def _reset_metrics(self, env_idx=None):
         if env_idx is not None:
@@ -780,6 +783,7 @@ class LiberoEnv(gym.Env):
             self._elapsed_steps[env_idx] = 0
             self._prev_grasped[mask] = False
             self._prev_lifted[mask] = False
+            self.suspicious_once[mask] = False
         else:
             self.prev_step_reward[:] = 0
             self.success_once[:] = False
@@ -789,6 +793,7 @@ class LiberoEnv(gym.Env):
             self._elapsed_steps[:] = 0
             self._prev_grasped[:] = False
             self._prev_lifted[:] = False
+            self.suspicious_once[:] = False
 
     def _record_metrics(self, step_reward, terminations, infos):
         episode_info = {}
@@ -802,7 +807,9 @@ class LiberoEnv(gym.Env):
             ]
 
         self.success_once = self.success_once | terminations
+        self.suspicious_once = self.suspicious_once | self._last_step_suspicious
         episode_info["success_once"] = self.success_once.copy()
+        episode_info["suspicious_once"] = self.suspicious_once.copy()
         episode_info["return"] = self.returns.copy()
         episode_info["episode_len"] = self.elapsed_steps.copy()
 
