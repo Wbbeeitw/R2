@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import gc
+import json
 import time
 from typing import Any, Callable, Literal, Optional
 
@@ -1003,3 +1004,36 @@ class MultiStepRolloutWorker(Worker):
     def set_global_step(self, global_step: int):
         if hasattr(self.hf_model, "set_global_step"):
             self.hf_model.set_global_step(global_step)
+        # grpo_degen rescue handshake: read the actor's rescue state file and
+        # apply the noise multiplier to the next rollout batch. Non-fatal: a
+        # missing/stale file simply leaves noise at its base level.
+        if hasattr(self.hf_model, "noise_scale"):
+            noise_scale = self._read_rescue_noise_scale()
+            if noise_scale is not None:
+                self.hf_model.noise_scale = noise_scale
+
+    def _read_rescue_noise_scale(self) -> Optional[float]:
+        """Return the rollout noise multiplier for grpo_degen rescue mode.
+
+        Returns the configured rescue noise scale when the actor's rescue state
+        file says rescue is active, 1.0 when it is not, and None when the
+        mechanism is disabled or the file is missing/broken (caller keeps the
+        current value).
+        """
+        alg = self.cfg.algorithm
+        if (
+            self.cfg.algorithm.adv_type != "grpo_degen"
+            or not alg.get("degen_rescue_enable", True)
+        ):
+            return None
+        rescue_file = alg.get("degen_rescue_file", None)
+        if not rescue_file:
+            return None
+        try:
+            with open(rescue_file) as f:
+                state = json.load(f)
+            if bool(state.get("rescue", False)):
+                return float(alg.get("degen_rescue_noise_scale", 1.15))
+            return 1.0
+        except Exception:
+            return None

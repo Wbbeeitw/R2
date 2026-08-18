@@ -126,60 +126,56 @@ def compute_grpo_degen_advantages(
     rewards: torch.Tensor,
     loss_mask: torch.Tensor,
     group_size: int,
-    degen_mode: str = "prefix",
+    p_hat: float = 0.31,
+    lambda_minus: float = 0.25,
+    alpha: float = 0.5,
     **kwargs,
 ):
-    """Compute GRPO advantages with degeneracy-triggered reward shaping.
+    """Compute GRPO advantages with degeneracy-triggered reward shaping (v1).
 
     Vanilla GRPO collapses to zero advantage whenever a group's reward std is
     zero (every trajectory scored identically). For sparse-reward VLA tasks this
     is the common case: an all-success group (every score == max) and an
     all-failure group (every score == 0) both have std == 0, so the model gets
-    no gradient even though "which success finished sooner" and "which failure
-    got further" are both informative.
+    no gradient even though "which success finished sooner" is informative and
+    "don't fail" is the crucial negative signal.
 
-    This variant leaves mixed groups (std > 0) untouched, and only recovers a
-    relative ranking from trajectory structure when a group degenerates:
+    v1 (Degeneracy-Triggered Explore-and-Residual GRPO) leaves mixed groups
+    (std > 0) on pure vanilla GRPO and only replaces degenerate groups:
 
-    - all-success: rank by completion efficiency (earlier completion wins),
-      derived from the first `done` step in the available `dones` tensor.
-    - all-failure: rank by conservative valid-prefix length — the earliest
-      suspicious action chunk (from the per-step `suspicious` boundary flags)
-      minus a one-chunk safety margin. Unlocalized trajectories (no boundary
-      detected) get zero credit (宁缺毋滥) rather than being forced to a full
-      prefix.
+    - all-success: A^+ = (1 - p_hat) * (1 + alpha * e_i), where e_i is the
+      min-max-normalized completion efficiency of each trajectory within its
+      group (earliest completion -> e = 1, latest -> e = 0). The (1 - p_hat)
+      residual scales by how surprising success currently is, and the
+      efficiency bonus restores a relative ranking vanilla loses.
+    - all-failure: A^- = -lambda_minus * p_hat, a constant negative residual
+      over the ENTIRE trajectory. No failure localization, no temporal cut:
+      every valid action token of a failed rollout carries the same negative
+      pressure, which self-limits as the task success rate rises
+      (E[A | R=0] = p/(1-p) grad_p, vanishing as p -> 1).
 
-    The all-failure treatment has two modes (`degen_mode`):
-
-    - "prefix" (default, main method): temporal cut. The min-max failure ranking
-      is broadcast only to the clean prefix `t < f_i`; actions after the
-      boundary get advantage 0 and are zeroed out of the returned loss mask, so
-      they never enter the policy-gradient denominator. Ranking is min-max so
-      the worst localized failure gets r=0 and the best gets r=1 (no negative
-      advantage for short prefixes).
-    - "ranking": ablation. The same min-max failure ranking, but broadcast over
-      the whole trajectory with no temporal cut (loss mask returned unchanged).
+    p_hat / lambda_minus / alpha are maintained by the actor worker (lagged
+    per-task success-rate estimate); this function only applies them.
 
     Args:
-        rewards: Per-trajectory scores. Shape [num_groups, group_size].
+        rewards: Per-trajectory scores. Shape [bsz] (group_size-consecutive
+            trajectories form a group).
         loss_mask: Loss mask for valid entries. Shape [n_steps, bsz].
         group_size: Group size for advantage computation.
-        degen_mode: "prefix" (default) or "ranking".
-        dones: (in kwargs) Done flags. Shape [n_steps + 1, bsz].
-        suspicious: (in kwargs) Per-chunk boundary flags. Shape [n_steps, bsz].
+        p_hat: Current estimate of the task success rate in [0, 1].
+        lambda_minus: Negative residual magnitude for all-failure groups.
+        alpha: Completion-efficiency bonus strength for all-success groups.
+        dones: (in kwargs) Done flags. Shape [n_steps + 1, bsz]. Used only for
+            all-success completion efficiency.
 
     Returns:
-        Tuple[advantages, None, loss_mask]: the third element is the (possibly
-        prefix-masked) loss mask, so the caller can propagate the temporal cut
-        into the policy-gradient denominator.
+        Tuple[advantages, None, None]: advantages broadcast over the full valid
+        trajectory (no temporal cut); the third element is None so the caller
+        keeps the original loss mask.
     """
     eps = 1e-6
     n_steps, bsz = loss_mask.shape
     num_groups = bsz // group_size
-    device = loss_mask.device
-
-    # Per-trajectory valid length (loss mask is 1 up to the first done step).
-    T_i = loss_mask.sum(dim=0).clamp(min=1).float()  # [bsz]
 
     grouped_rewards = rewards.view(num_groups, group_size)  # [num_groups, group_size]
     group_mean = grouped_rewards.mean(dim=-1, keepdim=True)
@@ -191,12 +187,10 @@ def compute_grpo_degen_advantages(
     all_success = degenerate & (group_mean.squeeze(-1) > 0)
     all_failure = degenerate & (group_mean.squeeze(-1) <= 0)
 
-    # Per-trajectory scalar advantage (mixed keeps vanilla) and clean-prefix
-    # length (full valid length unless a failure boundary is cut).
+    # Per-trajectory scalar advantage (mixed keeps vanilla).
     traj_adv = vanilla.view(-1)  # [bsz]
-    prefix_len = T_i.clone()  # [bsz]
 
-    # --- all-success: completion-efficiency ranking ---
+    # --- all-success: completion-efficiency residual ---
     # A success step sets `dones` to 1, so the first done index is the
     # completion step; earlier is better. The score carries no timing signal
     # (all successes score the same), which is exactly why vanilla degenerates.
@@ -211,66 +205,25 @@ def compute_grpo_degen_advantages(
         )
         completion_step = first_done.float().view(num_groups, group_size)
         max_step = completion_step.max(dim=-1, keepdim=True).values
-        efficiency = max_step - completion_step  # earlier completion -> larger
-        eff_mean = efficiency.mean(dim=-1, keepdim=True)
-        eff_std = efficiency.std(dim=-1, keepdim=True)
-        completion = (efficiency - eff_mean) / (eff_std + eps)
+        min_step = completion_step.min(dim=-1, keepdim=True).values
+        # [0, 1]: earlier completion -> larger.
+        efficiency = (max_step - completion_step) / (max_step - min_step + eps)
+        a_pos = (1.0 - p_hat) * (1.0 + alpha * efficiency)
         success_mask = all_success.repeat_interleave(group_size)  # [bsz]
-        traj_adv = torch.where(success_mask, completion.view(-1), traj_adv)
+        traj_adv = torch.where(success_mask, a_pos.view(-1), traj_adv)
 
-    # --- all-failure: min-max boundary ranking (+ temporal cut in prefix mode) ---
-    suspicious = kwargs.get("suspicious", None)
-    if all_failure.any() and suspicious is not None:
-        susp_bool = suspicious.bool()  # [n_steps, bsz]
-        first_susp = susp_bool.float().argmax(dim=0)  # [bsz]; 0 if never suspicious
-        localized = susp_bool.any(dim=0)  # [bsz]
-        # Conservative boundary: one chunk safety margin before the first
-        # suspicious action chunk.
-        f_i = (first_susp.float() - 1).clamp(min=1)  # [bsz]
-
-        # Quality = clean-prefix fraction of the trajectory; unlocalized -> 0.
-        q_i = torch.where(localized, f_i / T_i, torch.zeros_like(f_i))  # [bsz]
-        q_g = q_i.view(num_groups, group_size)
-        loc_g = localized.view(num_groups, group_size)
-
-        # Min-max over localized members only (unlocalized excluded from the
-        # normalization, 宁缺毋滥).
-        q_min = torch.where(
-            loc_g, q_g, torch.full_like(q_g, float("inf"))
-        ).min(dim=-1, keepdim=True).values
-        q_max = torch.where(
-            loc_g, q_g, torch.full_like(q_g, float("-inf"))
-        ).max(dim=-1, keepdim=True).values
-
-        r_g = (q_g - q_min) / (q_max - q_min + eps)
-        # No spread among localized members -> reinforce the common boundary.
-        no_spread = (q_max - q_min) < eps
-        r_g = torch.where(no_spread, torch.ones_like(r_g), r_g)
-        # Unlocalized get zero credit.
-        r_g = torch.where(loc_g, r_g, torch.zeros_like(r_g))
-
-        r_i = r_g.view(-1)  # [bsz]
-        failure_mask = all_failure.repeat_interleave(group_size)  # [bsz]
-
-        traj_adv = torch.where(failure_mask, r_i, traj_adv)
-        if degen_mode == "prefix":
-            # Cut the loss mask at the failure boundary for localized failures.
-            prefix_len = torch.where(failure_mask & localized, f_i, prefix_len)
-
-    # Broadcast the per-trajectory advantage over time, then apply the temporal
-    # cut (prefix_len == T_i everywhere except localized failures in prefix
-    # mode, so mixed/success/unlocalized-failure keep the full valid region).
-    t_idx = torch.arange(n_steps, device=device, dtype=prefix_len.dtype).unsqueeze(-1)
-    prefix_mask = t_idx < prefix_len.unsqueeze(0)  # [n_steps, bsz]
-
-    advantages = (
-        traj_adv.unsqueeze(0).expand(n_steps, bsz)
-        * loss_mask.float()
-        * prefix_mask.float()
+    # --- all-failure: absolute negative residual over the full trajectory ---
+    traj_adv = torch.where(
+        all_failure.repeat_interleave(group_size),
+        torch.full_like(traj_adv, -lambda_minus * p_hat),
+        traj_adv,
     )
-    ff_loss_mask = loss_mask.bool() & prefix_mask
 
-    return advantages, None, ff_loss_mask
+    # Broadcast the per-trajectory advantage over the full valid region (v1
+    # drops the prefix / ff_loss_mask temporal cut entirely).
+    advantages = traj_adv.unsqueeze(0).expand(n_steps, bsz) * loss_mask.float()
+
+    return advantages, None, None
 
 
 @register_advantage("grpo_dynamic")

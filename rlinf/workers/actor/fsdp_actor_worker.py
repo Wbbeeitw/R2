@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
 import time
 from functools import partial
 from typing import Optional
@@ -27,7 +29,9 @@ import rlinf.algorithms  # noqa: F401
 from rlinf.algorithms.expert import build_expert_model_config
 from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.algorithms.utils import (
+    calculate_scores,
     kl_penalty,
+    preprocess_embodied_advantages_inputs,
 )
 from rlinf.config import SupportedModel, torch_dtype_from_precision
 from rlinf.data.schema.embodied_types import Trajectory, convert_trajectories_to_batch
@@ -1085,6 +1089,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self._opd_teacher_model = None
         self.entropy_op_type = self.cfg.algorithm.get("entropy_op_type", "torch")
 
+        # grpo_degen v1 state: lagged per-task success-rate estimate (decayed
+        # counts, GPT design) + rescue state machine (all-fail -> G=8 + noise).
+        # Initialized so S/N == degen_p_init; beta in [0, 1) gives an effective
+        # EMA window of ~1/(1-beta) steps, so p_hat adapts quickly to the real
+        # rollout success distribution from the SFT-eval prior.
+        self._degen_beta = self.cfg.algorithm.get("degen_p_decay", 0.9)
+        p_init = self.cfg.algorithm.get("degen_p_init", 0.31)
+        self._degen_p_hat = float(p_init)
+        self._degen_s = p_init * self._degen_beta / (1.0 - self._degen_beta)
+        self._degen_n = 1.0 / (1.0 - self._degen_beta)
+        self._degen_rescue = False
+
         self.enable_sft_co_train = cfg.actor.get("enable_sft_co_train", False)
         self.version = 0
         if self.enable_sft_co_train:
@@ -1316,24 +1332,127 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "gamma": self.cfg.algorithm.get("gamma", 1),
             "gae_lambda": self.cfg.algorithm.get("gae_lambda", 1),
             "group_size": self.cfg.algorithm.get("group_size", 8),
-            "degen_mode": self.cfg.algorithm.get("degen_mode", "prefix"),
             "reward_type": self.cfg.algorithm.reward_type,
             "loss_mask": self.rollout_batch.get("loss_mask", None),
             "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
         }
 
+        # grpo_degen v1: override group_size (rescue G=8), inject p_hat / lambdas
+        # into the advantage computation, and update the p_hat / rescue state.
+        degen_metrics = {}
+        if self.cfg.algorithm.adv_type == "grpo_degen":
+            kwargs, degen_metrics = self._update_degen_state(kwargs)
+
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
 
         self.rollout_batch.update(advantages_and_returns)
-        # grpo_degen may return a prefix-masked loss_mask; do not clobber it
-        # with the original. Other adv types don't return one, so fall back.
+        # grpo_degen v1 returns modified_loss_mask=None, so the ORIGINAL loss
+        # mask is restored here (full-trajectory advantages, no temporal cut).
         if "loss_mask" not in advantages_and_returns and kwargs["loss_mask"] is not None:
             self.rollout_batch.update({"loss_mask": kwargs["loss_mask"]})
         if kwargs["loss_mask_sum"] is not None:
             self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
 
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        rollout_metrics.update(degen_metrics)
         return rollout_metrics
+
+    @Worker.timer("actor/update_degen_state")
+    def _update_degen_state(self, kwargs: dict) -> tuple[dict, dict]:
+        """grpo_degen v1 bookkeeping: lagged p_hat, rescue G override, metrics.
+
+        Reuses the same `preprocess_embodied_advantages_inputs` +
+        `calculate_scores` pipeline the registry runs, so the per-trajectory
+        scores (and hence the group classification) are exactly what
+        `compute_grpo_degen_advantages` sees. Mutates `kwargs` in place to
+        override group_size and inject p_hat / lambda_minus / alpha, and
+        returns the metric dict for the step log.
+        """
+        alg = self.cfg.algorithm
+        eps = 1e-6
+        cfg_group = int(alg.get("group_size", 8))
+        rescue_group = int(alg.get("degen_rescue_group_size", 8))
+        group_size_eff = (
+            rescue_group
+            if (self._degen_rescue and rescue_group > cfg_group)
+            else cfg_group
+        )
+
+        pre = preprocess_embodied_advantages_inputs(
+            rewards=kwargs["rewards"],
+            dones=kwargs["dones"],
+            values=None,
+            loss_mask=kwargs["loss_mask"],
+            loss_mask_sum=kwargs["loss_mask_sum"],
+            suspicious=kwargs.get("suspicious"),
+            reward_type=kwargs["reward_type"],
+            adv_type=kwargs["adv_type"],
+        )
+        pre["group_size"] = group_size_eff
+        scored = calculate_scores(rewards=pre["rewards"], dones=pre["dones"], **pre)
+        grouped = scored["rewards"]  # [num_groups, group_size_eff]
+
+        group_mean = grouped.mean(dim=-1)
+        group_std = grouped.std(dim=-1)
+        all_succ = (group_std < eps) & (group_mean > 0)
+        all_fail = (group_std < eps) & (group_mean <= 0)
+        num_groups = grouped.shape[0]
+        all_fail_groups = int(all_fail.sum())
+        all_succ_groups = int(all_succ.sum())
+        batch_all_fail = bool(all_fail.all()) if num_groups > 0 else False
+
+        # Lagged p_hat: this step's advantages use the OLD estimate; update now
+        # with this batch's realized scores (success count for sparse rewards).
+        kwargs["group_size"] = group_size_eff
+        kwargs["p_hat"] = self._degen_p_hat
+        # Registry dispatches fn(**kwargs) verbatim (no renaming): must use the
+        # function's own parameter names, not the config keys.
+        kwargs["lambda_minus"] = float(alg.get("degen_lambda_minus", 0.25))
+        kwargs["alpha"] = float(alg.get("degen_alpha", 0.5))
+
+        total_score = float(grouped.sum().item())
+        self._degen_s = self._degen_beta * self._degen_s + total_score
+        self._degen_n = (
+            self._degen_beta * self._degen_n + num_groups * group_size_eff
+        )
+        self._degen_p_hat = float(min(0.99, max(0.01, self._degen_s / self._degen_n)))
+
+        # Rescue: a whole-batch all-failure collapses the policy (no success
+        # signal to learn from) -> escalate to G=8 + noise for the NEXT step.
+        # Gate on degen_rescue_enable so the whole mechanism can be ablated.
+        rescue_enable = bool(alg.get("degen_rescue_enable", True))
+        rescue_file = alg.get("degen_rescue_file", None)
+        if rescue_enable:
+            self._degen_rescue = batch_all_fail
+            # Persist rescue state for the rollout worker (file handshake).
+            if rescue_file:
+                try:
+                    os.makedirs(os.path.dirname(rescue_file) or ".", exist_ok=True)
+                    with open(rescue_file, "w") as f:
+                        json.dump(
+                            {
+                                "rescue": bool(self._degen_rescue),
+                                "step": getattr(self, "optimizer_steps", 0),
+                            },
+                            f,
+                        )
+                except Exception as e:  # non-fatal: noise lags one step at worst
+                    self.logger.warning(
+                        f"grpo_degen: failed to write rescue file: {e}"
+                    )
+        else:
+            self._degen_rescue = False
+
+        return kwargs, {
+            "degen_p_hat": self._degen_p_hat,
+            "degen_mixed_groups": float(
+                num_groups - all_fail_groups - all_succ_groups
+            ),
+            "degen_all_failure_groups": float(all_fail_groups),
+            "degen_all_success_groups": float(all_succ_groups),
+            "degen_rescue": float(self._degen_rescue),
+            "degen_group_size": float(group_size_eff),
+        }
 
     @Worker.timer("actor/compute_opd_teacher_logprobs")
     def compute_opd_teacher_logprobs(self) -> None:

@@ -74,6 +74,11 @@ class OpenPiPytorchRLActionModel(OpenPiPytorchEvalActionModel):
         self.model_action_dim = pi0_model.action_dim
         self.rl_cfg = rl_cfg
 
+        # Mutable noise multiplier for the SDE chain (grpo_degen rescue mode).
+        # Rollout workers set this from the actor's rescue state file; a value
+        # > 1 temporarily widens exploration after a whole-batch all-failure.
+        self.noise_scale = 1.0
+
         if rl_cfg.add_value_head:
             if not rl_cfg.value_after_vlm:
                 raise NotImplementedError(
@@ -217,7 +222,7 @@ class OpenPiPytorchRLActionModel(OpenPiPytorchEvalActionModel):
                 v_t,
                 idx_step,
                 noise_method=method,
-                noise_level=rl_cfg.noise_level,
+                noise_level=rl_cfg.noise_level * self.noise_scale,
                 num_steps=num_steps,
             )
             step_noise = torch.randn(
@@ -340,7 +345,7 @@ class OpenPiPytorchRLActionModel(OpenPiPytorchEvalActionModel):
             v_t,
             idx0,
             noise_method=rl_cfg.noise_method,
-            noise_level=rl_cfg.noise_level,
+            noise_level=rl_cfg.noise_level * self.noise_scale,
             num_steps=self.num_steps,
         )
         log_probs = rl_sampler.gaussian_logprob(
