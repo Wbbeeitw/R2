@@ -1389,7 +1389,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             adv_type=kwargs["adv_type"],
         )
         pre["group_size"] = group_size_eff
-        scored = calculate_scores(rewards=pre["rewards"], dones=pre["dones"], **pre)
+        # pre already carries rewards/dones (reshaped by the preprocess step);
+        # passing them again alongside **pre would be a duplicate keyword.
+        scored = calculate_scores(**pre)
         grouped = scored["rewards"]  # [num_groups, group_size_eff]
 
         group_mean = grouped.mean(dim=-1)
