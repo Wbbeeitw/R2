@@ -1411,6 +1411,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         # function's own parameter names, not the config keys.
         kwargs["lambda_minus"] = float(alg.get("degen_lambda_minus", 0.25))
         kwargs["alpha"] = float(alg.get("degen_alpha", 0.5))
+        # all-success efficiency branch gate: False keeps all-success groups on
+        # pure vanilla (advantage 0), isolating the R - p_hat all-failure term.
+        kwargs["all_success_enable"] = bool(
+            alg.get("degen_all_success_enable", True)
+        )
 
         total_score = float(grouped.sum().item())
         self._degen_s = self._degen_beta * self._degen_s + total_score

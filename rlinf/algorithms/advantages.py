@@ -129,6 +129,7 @@ def compute_grpo_degen_advantages(
     p_hat: float = 0.31,
     lambda_minus: float = 0.25,
     alpha: float = 0.5,
+    all_success_enable: bool = True,
     **kwargs,
 ):
     """Compute GRPO advantages with degeneracy-triggered reward shaping (v1).
@@ -195,7 +196,7 @@ def compute_grpo_degen_advantages(
     # completion step; earlier is better. The score carries no timing signal
     # (all successes score the same), which is exactly why vanilla degenerates.
     dones = kwargs.get("dones", None)
-    if all_success.any() and dones is not None:
+    if all_success.any() and all_success_enable and dones is not None:
         n_steps_d = dones.shape[0] - 1  # dones is [n_steps + 1, bsz]
         dones_bool = dones.bool()
         first_done = dones_bool.float().argmax(dim=0)  # [bsz]
