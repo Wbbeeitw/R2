@@ -1342,6 +1342,26 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         degen_metrics = {}
         if self.cfg.algorithm.adv_type == "grpo_degen":
             kwargs, degen_metrics = self._update_degen_state(kwargs)
+        else:
+            # vanilla observability (logging only, no behavior change): log the
+            # same group composition so the breadth-map x-axis (vanilla
+            # homogeneous rate) is comparable with grpo_degen runs.
+            try:
+                pre = preprocess_embodied_advantages_inputs(
+                    rewards=kwargs["rewards"],
+                    dones=kwargs["dones"],
+                    values=None,
+                    loss_mask=kwargs["loss_mask"],
+                    loss_mask_sum=kwargs["loss_mask_sum"],
+                    suspicious=kwargs.get("suspicious"),
+                    reward_type=kwargs["reward_type"],
+                    adv_type=kwargs["adv_type"],
+                )
+                pre["group_size"] = kwargs["group_size"]
+                grouped = calculate_scores(**pre)["rewards"]
+                degen_metrics.update(self._count_group_composition(grouped))
+            except Exception as e:  # non-fatal: metrics only
+                self.logger.warning(f"group composition metrics skipped: {e}")
 
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
 
@@ -1356,6 +1376,26 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
         rollout_metrics.update(degen_metrics)
         return rollout_metrics
+
+    def _count_group_composition(self, grouped) -> dict:
+        """Logging-only group composition (all-fail / all-success / mixed).
+
+        Mirrors the classification inside compute_grpo_degen_advantages so the
+        breadth-map x-axis (vanilla homogeneous rate = all-fail + all-success)
+        is comparable across adv_type. No behavior change.
+        """
+        eps = 1e-6
+        gm = grouped.mean(dim=-1)
+        gs = grouped.std(dim=-1)
+        all_fail = int(((gs < eps) & (gm <= 0)).sum())
+        all_succ = int(((gs < eps) & (gm > 0)).sum())
+        num_groups = grouped.shape[0]
+        return {
+            "group_size": float(grouped.shape[1]),
+            "group_all_failure_groups": float(all_fail),
+            "group_all_success_groups": float(all_succ),
+            "group_mixed_groups": float(num_groups - all_fail - all_succ),
+        }
 
     @Worker.timer("actor/update_degen_state")
     def _update_degen_state(self, kwargs: dict) -> tuple[dict, dict]:
@@ -1459,6 +1499,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "degen_all_success_groups": float(all_succ_groups),
             "degen_rescue": float(self._degen_rescue),
             "degen_group_size": float(group_size_eff),
+            **self._count_group_composition(grouped),
         }
 
     @Worker.timer("actor/compute_opd_teacher_logprobs")
