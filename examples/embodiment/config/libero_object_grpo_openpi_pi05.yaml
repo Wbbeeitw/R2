@@ -64,6 +64,17 @@ algorithm:
   filter_rewards: True
   rewards_lower_bound: 0.1
   rewards_upper_bound: 0.9
+  # grpo_degen v1 (Degeneracy-Triggered Explore-and-Residual GRPO) knobs.
+  # Inactive unless algorithm.adv_type=grpo_degen. Present in the struct
+  # config so Hydra CLI overrides are accepted.
+  degen_p_init: 0.31
+  degen_p_decay: 0.9
+  degen_lambda_minus: 0.25
+  degen_alpha: 0.5
+  degen_rescue_group_size: 8
+  degen_rescue_noise_scale: 1.15
+  degen_rescue_enable: True
+  degen_rescue_file: null
 env:
   group_name: "EnvGroup"
 
