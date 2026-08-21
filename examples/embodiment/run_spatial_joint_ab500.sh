@@ -4,6 +4,8 @@
 #   Arm B: grpo_degen v1 (adv_type=grpo_degen + degen knobs) 500 steps
 # Each arm saves checkpoints every 100 steps (100/200/300/400/500) and runs a
 # 32-env eval per checkpoint. Run inside the rlinf container (GPUs 4-7 only).
+# NOTE: GRPO cannot use runner.use_training_pipeline=True (config.py asserts
+# adv_type==gae for pipeline); we run serial. ~50s/step observed on server 2.
 # Stage marker: /data/grpo/result/spatial_joint_ab500_stage.txt (monitor this)
 set -u
 
@@ -44,7 +46,6 @@ $PY $TRAIN \
   --config-name libero_spatial_grpo_openpi_pi05 \
   runner.logger.log_path=$RES/spatial_joint_ab500_vanilla \
   runner.max_steps=$STEPS runner.save_interval=100 \
-  runner.use_training_pipeline=True \
   actor.model.model_path=$SFT \
   rollout.model.model_path=$SFT \
   actor.fsdp_config.use_orig_params=True \
@@ -66,7 +67,6 @@ $PY $TRAIN \
   --config-name libero_spatial_grpo_openpi_pi05 \
   runner.logger.log_path=$RES/spatial_joint_ab500_degen \
   runner.max_steps=$STEPS runner.save_interval=100 \
-  runner.use_training_pipeline=True \
   actor.model.model_path=$SFT \
   rollout.model.model_path=$SFT \
   actor.fsdp_config.use_orig_params=True \
