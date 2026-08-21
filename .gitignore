@@ -66,3 +66,6 @@ Thumbs.db
 /darc_vla/data/
 /darc_vla/*.pkl
 /darc_vla/*.npz
+# scratch analysis scripts (user local-only, not pushed)
+/darc_vla/*.py
+/_*.sh
