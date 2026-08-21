@@ -69,3 +69,6 @@ Thumbs.db
 # scratch analysis scripts (user local-only, not pushed)
 /darc_vla/*.py
 /_*.sh
+
+# scratch analysis docs (user local-only)
+/darc_vla/*.md
