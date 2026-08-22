@@ -130,6 +130,8 @@ def compute_grpo_degen_advantages(
     lambda_minus: float = 0.25,
     alpha: float = 0.5,
     all_success_enable: bool = True,
+    speed_residual_enable: bool = False,
+    speed_residual_scale: float = 0.05,
     **kwargs,
 ):
     """Compute GRPO advantages with degeneracy-triggered reward shaping (v1).
@@ -146,9 +148,9 @@ def compute_grpo_degen_advantages(
 
     - all-success: A^+ = (1 - p_hat) * (1 + alpha * e_i), where e_i is the
       min-max-normalized completion efficiency of each trajectory within its
-      group (earliest completion -> e = 1, latest -> e = 0). The (1 - p_hat)
-      residual scales by how surprising success currently is, and the
-      efficiency bonus restores a relative ranking vanilla loses.
+      group (earliest completion -> e = 1, latest -> e = 0). The optional
+      guarded speed-residual mode instead adds a small centered speed term,
+      preserving the group-average success residual.
     - all-failure: A^- = -lambda_minus * p_hat, a constant negative residual
       over the ENTIRE trajectory. No failure localization, no temporal cut:
       every valid action token of a failed rollout carries the same negative
@@ -166,6 +168,11 @@ def compute_grpo_degen_advantages(
         p_hat: Current estimate of the task success rate in [0, 1].
         lambda_minus: Negative residual magnitude for all-failure groups.
         alpha: Completion-efficiency bonus strength for all-success groups.
+        speed_residual_enable: Enable the guarded, centered speed residual for
+            all-success groups. Disabled by default to preserve the original
+            v1 behavior.
+        speed_residual_scale: Relative magnitude of the centered speed
+            residual when enabled.
         dones: (in kwargs) Done flags. Shape [n_steps + 1, bsz]. Used only for
             all-success completion efficiency.
 
@@ -209,7 +216,23 @@ def compute_grpo_degen_advantages(
         min_step = completion_step.min(dim=-1, keepdim=True).values
         # [0, 1]: earlier completion -> larger.
         efficiency = (max_step - completion_step) / (max_step - min_step + eps)
-        a_pos = (1.0 - p_hat) * (1.0 + alpha * efficiency)
+        base = torch.full_like(efficiency, 1.0 - p_hat)
+        if speed_residual_enable:
+            # Keep the group-average success residual unchanged. Only a small,
+            # centered preference for earlier completions is added when every
+            # trajectory has a real done and the group has a nonzero spread.
+            all_done = any_done.view(num_groups, group_size).all(
+                dim=-1, keepdim=True
+            )
+            has_spread = (max_step - min_step) > eps
+            speed_valid = all_done & has_spread
+            centered_efficiency = efficiency - efficiency.mean(dim=-1, keepdim=True)
+            residual = speed_residual_scale * base * centered_efficiency
+            a_pos = base + torch.where(
+                speed_valid, residual, torch.zeros_like(residual)
+            )
+        else:
+            a_pos = base * (1.0 + alpha * efficiency)
         success_mask = all_success.repeat_interleave(group_size)  # [bsz]
         traj_adv = torch.where(success_mask, a_pos.view(-1), traj_adv)
 
