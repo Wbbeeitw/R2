@@ -70,8 +70,6 @@ algorithm:
   degen_p_decay: 0.9
   degen_lambda_minus: 0.25
   degen_alpha: 0.5
-  degen_speed_residual_enable: False
-  degen_speed_residual_scale: 0.05
   degen_rescue_group_size: 8
   degen_rescue_noise_scale: 1.15
   degen_rescue_enable: True

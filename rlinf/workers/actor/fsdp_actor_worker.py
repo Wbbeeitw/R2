@@ -1416,12 +1416,6 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "gae_lambda": self.cfg.algorithm.get("gae_lambda", 1),
             "group_size": self.cfg.algorithm.get("group_size", 8),
             "reward_type": self.cfg.algorithm.reward_type,
-            "speed_residual_enable": self.cfg.algorithm.get(
-                "degen_speed_residual_enable", False
-            ),
-            "speed_residual_scale": self.cfg.algorithm.get(
-                "degen_speed_residual_scale", 0.05
-            ),
             "loss_mask": self.rollout_batch.get("loss_mask", None),
             "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
         }
