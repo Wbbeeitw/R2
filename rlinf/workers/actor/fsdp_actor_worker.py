@@ -1075,6 +1075,8 @@ class FSDPActor(FSDPModelManager, Worker):
 
 
 class EmbodiedFSDPActor(FSDPModelManager, Worker):
+    _DEGEN_STATE_SCHEMA_VERSION = 1
+
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
         super().__init__(cfg.actor, self._world_size, self._rank)
@@ -1130,6 +1132,87 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self._rollout_all_ranks = list(
             range(self._component_placement.get_world_size("rollout"))
         )
+
+    def _degen_state_checkpoint_enabled(self) -> bool:
+        return bool(
+            self.cfg.algorithm.get("degen_state_checkpoint_enable", False)
+        ) and self.cfg.algorithm.adv_type == "grpo_degen"
+
+    def _degen_state_checkpoint_path(self, checkpoint_dir: str) -> str:
+        return os.path.join(
+            checkpoint_dir,
+            f"grpo_degen_state_rank_{self._rank}.json",
+        )
+
+    def _save_degen_state(self, checkpoint_dir: str, step: int) -> None:
+        if not self._degen_state_checkpoint_enabled():
+            return
+
+        state = {
+            "schema_version": self._DEGEN_STATE_SCHEMA_VERSION,
+            "rank": int(self._rank),
+            "world_size": int(self._world_size),
+            "step": int(step),
+            "beta": float(self._degen_beta),
+            "p_hat": float(self._degen_p_hat),
+            "success_ema": float(self._degen_s),
+            "count_ema": float(self._degen_n),
+            "rescue_active": bool(self._degen_rescue),
+        }
+        path = self._degen_state_checkpoint_path(checkpoint_dir)
+        tmp_path = f"{path}.tmp.{os.getpid()}"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(state, f, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp_path, path)
+
+    def _load_degen_state(self, checkpoint_dir: str) -> None:
+        if not self._degen_state_checkpoint_enabled():
+            return
+
+        path = self._degen_state_checkpoint_path(checkpoint_dir)
+        strict = bool(
+            self.cfg.algorithm.get("degen_state_checkpoint_strict", False)
+        )
+        if not os.path.exists(path):
+            message = f"grpo_degen state sidecar not found: {path}"
+            if strict:
+                raise FileNotFoundError(message)
+            self.logger.warning("%s; keeping initialized state", message)
+            return
+
+        with open(path, encoding="utf-8") as f:
+            state = json.load(f)
+
+        expected = {
+            "schema_version": self._DEGEN_STATE_SCHEMA_VERSION,
+            "rank": int(self._rank),
+            "world_size": int(self._world_size),
+        }
+        for key, value in expected.items():
+            if state.get(key) != value:
+                raise ValueError(
+                    f"Invalid grpo_degen state {path}: "
+                    f"{key}={state.get(key)!r}, expected {value!r}"
+                )
+        if not np.isclose(float(state["beta"]), float(self._degen_beta)):
+            raise ValueError(
+                f"Invalid grpo_degen state {path}: beta={state['beta']!r}, "
+                f"expected {self._degen_beta!r}"
+            )
+
+        self._degen_p_hat = float(state["p_hat"])
+        self._degen_s = float(state["success_ema"])
+        self._degen_n = float(state["count_ema"])
+        self._degen_rescue = bool(state["rescue_active"])
+
+    def save_checkpoint(self, save_base_path: str, step: int = 0) -> None:
+        super().save_checkpoint(save_base_path, step)
+        self._save_degen_state(save_base_path, step)
+
+    def load_checkpoint(self, load_base_path: str) -> None:
+        super().load_checkpoint(load_base_path)
+        self._load_degen_state(load_base_path)
 
     def init_worker(self) -> None:
         """

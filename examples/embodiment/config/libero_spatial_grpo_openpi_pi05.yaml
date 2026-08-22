@@ -75,6 +75,8 @@ algorithm:
   degen_rescue_noise_scale: 1.15
   degen_rescue_enable: True
   degen_rescue_file: null
+  degen_state_checkpoint_enable: False
+  degen_state_checkpoint_strict: False
 env:
   group_name: "EnvGroup"
 
